@@ -171,3 +171,16 @@ ZIG_GLOBAL_CACHE_DIR="$TEMP/penys-zig-cache" ZIG_LOCAL_CACHE_DIR="$TEMP/penys-zi
 
 注意：`sdp.c` 里 `o=` 的随机数走 `RAND_bytes`（真机上是 libcrypto），主机测试在自己的
 文件里给了一个确定性 stub，所以不必链接 OpenSSL。
+
+## 6. 一条命令验证真机
+
+```sh
+sh PenYS/scripts/device-verify.sh      # 在工作区根目录（含 PenYS/ 与 env/ 的那一层）跑
+```
+
+它做四件事：push 新包 → `miniapp_cli install`（顺带重启 app，因为 `miniapp_cli` 没有 stop）
+→ 清空 `/tmp/penys.log` 并按正确写法 `start <appid> index`（页面名不能带 `--`）→ 等 25 秒后
+把关键日志行抓出来并逐行解释。adbd 认证、MSYS 路径改写这些坑都已经在脚本里处理掉了。
+
+仍然需要人做的事：在设备上点「开始游戏」（触摸注入在这台机器上无效），或者临时把
+`DEV_AUTOSTART` 钩子加回 `bootTick()` 后重新打包。
