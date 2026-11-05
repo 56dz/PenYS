@@ -124,11 +124,28 @@ export function restore() {
   return login.restore();
 }
 
+/* StartGameReq 需要 aid，dispatch 响应里没有：把 session.aid 补上再起播。 */
+export function ensureAid() {
+  return login.ensureAid();
+}
+
 /* 冷启动时调一次：恢复会话 + 把落盘的 cookie jar 灌回 native。
- * 不调也能工作（只是每次都要重新扫码）。 */
+ * 不调也能工作（只是每次都要重新扫码）。
+ * storage 里没会话时再试一次 cookie 重建：重装/换 slot 会清掉 Falcon storage，
+ * 但 jar 落的是 /userdata/penys/ys_cookies.txt，文件还在，cookie 也还能换票。 */
 export function bootstrap() {
   return login.restore().then(function (s) {
-    return { loggedIn: !!s, session: s };
+    if (s) {
+      return Promise.resolve(login.ensureAid())
+        .catch(function () { return ''; })
+        .then(function () { return { loggedIn: true, session: s }; });
+    }
+    return Promise.resolve()
+      .then(function () { return login.recoverSession(); })
+      .then(function (r) { return { loggedIn: !!r, session: r, recovered: !!r }; })
+      .catch(function (e) {
+        return { loggedIn: false, session: null, error: (e && e.message) || String(e) };
+      });
   });
 }
 
@@ -172,6 +189,7 @@ export default {
   getSession: getSession,
   restore: restore,
   bootstrap: bootstrap,
+  ensureAid: ensureAid,
   nativeStatus: nativeStatus,
   ensureNative: ensureNative,
 };

@@ -368,6 +368,73 @@ export async function gamerLogin() {
   return res.data || {};
 }
 
+/* 补齐 session 里的身份字段（aid / uid / nickname / mid）。
+ *
+ * aid（gamer 账号 id）是 StartGameReq 的 field 2 —— 缺了它服务端
+ * 照样回 StartGameRsp(retcode=1)，但媒体面永远不会接受我们的 DTLS，
+ * 表现就是"一直停在握手超时"。dispatch 响应里没有 aid，gamerLogin 也不给
+ * （真机实测它的 data 只有 new_user 一个键），唯一的来源是 passport 的
+ * verifyCookieToken -> data.user_info.aid。
+ *
+ * 老会话（以及从 cookie jar 恢复出来的会话）可能是 aid:''，
+ * 这里补一次并落盘；失败只会让 StartGameReq 少一个字段，不阻塞登录入口。 */
+export async function ensureAid() {
+  if (!state.session) return '';
+  if (state.session.aid && state.session.uid) return state.session.aid;
+  var changed = false;
+  try {
+    var me = await http.requestJson({
+      url: C.PASSPORT_BASE + '/account/ma-cn-session/web/verifyCookieToken',
+      method: 'POST',
+      headers: passportHeaders(),
+      body: {},
+      timeoutMs: C.HTTP_TIMEOUT_MS,
+      cookieJarKey: state.jarKey
+    });
+    if (me.code === 0 && me.data && me.data.user_info) {
+      var ui = me.data.user_info;
+      if (ui.aid && String(ui.aid) !== state.session.aid) {
+        state.session.aid = String(ui.aid);
+        changed = true;
+      }
+      if (ui.uid && String(ui.uid) !== state.session.uid) {
+        state.session.uid = String(ui.uid);
+        changed = true;
+      }
+      if (ui.mid && ui.mid !== state.session.mid) {
+        state.session.mid = ui.mid;
+        changed = true;
+      }
+      if (ui.nickname && ui.nickname !== state.session.nickname) {
+        state.session.nickname = ui.nickname;
+        changed = true;
+      }
+      /* passport 经常只给 mid，不给 nickname；mid 就是米游社 id，
+       * 拿它当显示名，顶栏才不会掉回"未登录"。 */
+      if (!ui.nickname && !state.session.nickname && ui.mid) {
+        state.session.nickname = ui.mid;
+        changed = true;
+      }
+      if (!ui.uid && !state.session.uid && ui.mid) {
+        state.session.uid = ui.mid;
+        changed = true;
+      }
+      if (ui.head_icon && ui.head_icon !== state.session.avatar) {
+        state.session.avatar = ui.head_icon;
+        changed = true;
+      }
+    }
+  } catch (e) {
+    safeWarn('[ys] ensureAid: verifyCookieToken 失败: ' + ((e && e.message) || e));
+  }
+  if (changed) {
+    try { await storage.saveSession(state.session); } catch (e) { /* ignore */ }
+  }
+  safeWarn('[ys] ensureAid: aid=' + (state.session.aid ? '有' : '空') +
+           ' uid=' + (state.session.uid ? '有' : '空'));
+  return state.session.aid || '';
+}
+
 /* 第 6 步（对外）：Confirmed 之后把 3/4/5 串起来，落盘会话。
  *
  * ticket 是一次性的：轮询里拿到 Confirmed 之后它就已经被消费，
@@ -508,6 +575,82 @@ export async function logout() {
   return { ok: true };
 }
 
+/* 只用 cookie jar 重建会话（不需要二维码）。
+ *
+ * 为什么需要这条路：会话元数据（combo_token）存在 Falcon storage，重装/换 slot
+ * 会丢；而 cookie jar 落的是 /userdata/penys/ys_cookies.txt，文件还在。
+ * 于是 cold start 会出现「storage 里没会话、但 jar 里还有有效 cookie」的状态，
+ * 旧代码直接判未登录并要求重新扫码 —— 明明 cookie 还能换票。
+ *
+ * 复用扫码链的第 3/4/5 步即可：webVerifyForGame -> webLoginCombo -> gamerLogin。
+ * 三步都只依赖 jar，不依赖 ticket。任何一步失败就返回 null（降级为扫码）。 */
+export async function recoverSession() {
+  if (state.session) return state.session;
+  await ensureJar();
+  var jar = '';
+  try { jar = storage.dumpJar() || ''; } catch (e) { jar = ''; }
+  if (jar.indexOf('cookie_token') < 0) return null;
+  try {
+    await webVerifyForGame();
+  } catch (e) {
+    /* webVerifyForGame 只是"给游戏看一次登录态"，失败不代表 cookie 无效 */
+    safeWarn('[ys] recover: webVerifyForGame 跳过: ' + ((e && e.message) || e));
+  }
+  var combo;
+  try {
+    combo = await webLoginCombo();
+  } catch (e) {
+    safeWarn('[ys] recover: webLogin 失败: ' + ((e && e.message) || e));
+    return null;
+  }
+  var session = {
+    uid: '',
+    nickname: '',
+    avatar: '',
+    openId: combo.open_id,
+    comboToken: combo.combo_token,
+    accountType: combo.account_type,
+    fatigueRemind: combo.fatigue_remind,
+    aid: '',
+    recoveredAt: Date.now()
+  };
+  session.comboHeader = buildComboHeader(session);
+  state.session = session;
+  try {
+    var gamer = await gamerLogin();
+    session.aid = gamer.aid || '';
+  } catch (e) {
+    state.session = null;
+    safeWarn('[ys] recover: gamerLogin 失败: ' + ((e && e.message) || e));
+    return null;
+  }
+  /* 昵称/uid 只能靠 verifyCookieToken 补，失败不影响起播 */
+  try {
+    var me = await http.requestJson({
+      url: C.PASSPORT_BASE + '/account/ma-cn-session/web/verifyCookieToken',
+      method: 'POST',
+      headers: passportHeaders(),
+      body: {},
+      timeoutMs: C.HTTP_TIMEOUT_MS,
+      cookieJarKey: state.jarKey
+    });
+    if (me.code === 0 && me.data) {
+      session.uid = String(me.data.user_info ? (me.data.user_info.uid || '') : (me.data.uid || ''));
+      if (me.data.user_info) {
+        session.nickname = me.data.user_info.nickname || '';
+        session.avatar = me.data.user_info.head_icon || '';
+      }
+    }
+  } catch (e) {
+    safeWarn('[ys] recover: verifyCookieToken 失败: ' + ((e && e.message) || e));
+  }
+  await storage.saveSession(session);
+  storage.saveJar();
+  safeWarn('[ys] 会话已从 cookie jar 恢复 aid=' + (session.aid ? '有' : '空') +
+           ' nickname=' + (session.nickname || '空'));
+  return session;
+}
+
 function describe(res) {
   return (res && (res.message || res.raw)) ? String(res.message || res.raw).slice(0, 200) : '';
 }
@@ -528,6 +671,8 @@ export default {
   buildComboHeader: buildComboHeader,
   signPayload: signPayload,
   restore: restore,
+  recoverSession: recoverSession,
+  ensureAid: ensureAid,
   isLoggedIn: isLoggedIn,
   getSession: getSession,
   jarKey: jarKey,

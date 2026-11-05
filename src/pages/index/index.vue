@@ -565,6 +565,9 @@ export default {
     this._rect = fitEvenRect(PROFILE_SRC.w, PROFILE_SRC.h, VIDEO_BOX);
     /* 最近一次成功调度的 sdkParam：onHide stop 后回前台用它重新 start */
     this._sdkParam = '';
+    /* gamer 账号 id：native StartGameReq 必需，sdk_param 里没有。
+     * 冷启动由 syncProfileFromSession() 从落盘会话里补，登录成功时同源。 */
+    this._aid = '';
     /* screenOff 时重试唤屏的节流时间戳（5s 一次，别 5Hz 猛调 hal-screen） */
     this._soRetryT = 0;
 
@@ -699,10 +702,47 @@ export default {
         logged = false;
       }
       if (logged) {
+        /* 冷启动是从落盘 session 恢复的，不会再走一遍 finishLogin，
+         * 所以 nickname/uid/aid 必须在这里补一次。漏了这一步的表现就是
+         * 「顶栏显示未登录，但剩余时长正常显示」——钱包走的是 cookie
+         * jar，与这处 UI 状态无关，所以看着像两个 bug，其实是同一个。 */
+        this.syncProfileFromSession();
         this.gotoHome();
       } else {
         this.gotoLogin();
       }
+    },
+
+    /* 把当前登录会话里的身份信息同步到页面状态。
+     * aid 是 native StartGameReq 的必需字段，sdk_param 里没有它，
+     * 只能从这里传下去（见 services/player.js start()）。 */
+    syncProfileFromSession() {
+      let s = null;
+      try {
+        s = ys.getSession ? ys.getSession() : null;
+      } catch (e) {
+        s = null;
+      }
+      if (!s) return;
+      /* 昵称/米游社 id 三选一：passport 的 user_info 只保证给 mid
+       * （形如 0tmr5vsumg_mhy），nickname 有时是空的。只认 nickname 的话
+       * 顶栏会显示"未登录"——而其实会话好着，连剩余时长都在。 */
+      var name = s.nickname || s.mid || '';
+      var sid = s.uid || s.mid || '';
+      if (name) this.nickname = String(name);
+      if (sid) this.uid = String(sid);
+      this._aid = s.aid ? String(s.aid) : '';
+      logWarn('身份同步 nickname=' + (this.nickname ? '有' : '空') +
+              ' uid=' + (this.uid ? '有' : '空') +
+              ' aid=' + (this._aid ? '有' : '空'));
+    },
+
+    /* 起播时读 aid。优先用缓存，缓存空时再问一次会话，避免冷启动
+     * 那一次同步失败就把整局起播拖死（服务端会因缺 aid 直接沉默）。 */
+    currentAid() {
+      if (this._aid) return this._aid;
+      this.syncProfileFromSession();
+      return this._aid || '';
     },
 
     /* ---------- login ---------- */
@@ -832,6 +872,8 @@ export default {
       }
       this.nickname = r.nickname || '';
       this.uid = r.uid ? String(r.uid) : '';
+      /* aid 来自登录会话（gamer/api/login），起播时要用 */
+      this.syncProfileFromSession();
       logWarn('登录完成 nickname=' + (this.nickname ? '有' : '空') + ' uid=' + (this.uid ? '有' : '空'));
       this.gotoHome();
     },
@@ -967,10 +1009,23 @@ export default {
          * 是计费动作，只有走到这里才发 —— 即用户已在二次确认弹层点了「确认开始」
          * （那句「申请成功后会立刻开始计费」就是知情同意）。 */
         try {
-          const p = await ys.dispatchPaas({ confirmBilling: true });
+          this.dispStep = 2;
+          const p = await ys.dispatchPaas({
+            confirmBilling: true,
+            onProgress: (q) => {
+              if (this._dead || myGen !== this._gen) return;
+              if (q && q.resultCode === 'QUEUED') {
+                const pos = num(q.position);
+                const total = num(q.total);
+                this.queueText = total > 0 ? '排队中 前方 ' + pos + ' 人 / 共 ' + total + ' 人' : '排队中，请稍候…';
+                logWarn('计费排队中 pos=' + pos + '/' + total);
+              }
+            }
+          });
           if (this._dead || myGen !== this._gen) return;
           if (p && p.ok === false) {
-            this.showError(-3001, '计费调度排队中：' + (p.message || p.resultCode || ''), 'dispatch');
+            const code = p.resultCode === 'QUEUE_TIMEOUT' ? -3001 : -3001;
+            this.showError(code, (p.message || p.resultCode || '计费调度未完成'), 'dispatch');
             return;
           }
           sdkParam = p && p.sdkParam;
@@ -1016,7 +1071,7 @@ export default {
 
       let res = null;
       try {
-        res = await player.start({ sdkParam: sdkParam, rect: this._rect || VIDEO_BOX });
+        res = await player.start({ sdkParam: sdkParam, rect: this._rect || VIDEO_BOX, aid: this.currentAid() });
       } catch (e) {
         res = { ok: false, code: 'THROW', error: (e && e.message) || String(e) };
       }
@@ -1292,7 +1347,7 @@ export default {
         this.plErr = '正在连接视频流…';
         this.statText = '连接中';
         try {
-          const res = await player.start({ sdkParam: this._sdkParam, rect: this._rect || VIDEO_BOX });
+          const res = await player.start({ sdkParam: this._sdkParam, rect: this._rect || VIDEO_BOX, aid: this.currentAid() });
           if (this._dead || myGen !== this._gen) return;
           if (res && res.ok) {
             this.videoReady = true;
