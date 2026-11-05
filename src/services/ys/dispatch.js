@@ -396,15 +396,59 @@ export async function dispatch(opts) {
  *   2. 必须已经跑过 dispatch() 拿到 nodeId/regionIds。
  * 返回里带 sdkParam + 解好的 endpoints（直接喂给 session.c）。
  */
-export async function dispatchPaas(opts) {
-  opts = opts || {};
-  if (opts.confirmBilling !== true) {
-    throw new Error('BILLING_GUARD: paasDispatch 会开始计费，必须显式传 confirmBilling:true');
-  }
-  if (!last.nodeId || !last.regionIds) {
-    throw new Error('NO_NODE: 需要先调用 dispatch() 拿到 nodeId/regionIds');
-  }
+function _sleep(ms) {
+  return new Promise(function (resolve) { setTimeout(resolve, ms); });
+}
 
+/* 统一把一个 dispatch 类响应（paasDispatch 或 getDispatchTicketInfo）解析成
+ * {ok, resultCode, sdkParam, ...}。QUEUED 时带上队列 ticket/interval/位置。
+ * 注意 getDispatchTicketInfo 的响应形状服务端没公开文档（yys 里 QUEUED 分支
+ * 「账号秒进，未触发，形态按代码推导」），所以这里按「与 paasDispatch 同形」解析，
+ * 并对 sdk_param 位置做多处兜底（finish_result.sdk_param / 顶层 sdk_param）。 */
+function _parseDispatchResult(d, source) {
+  var resultCode = d.result_code || '';
+  if (resultCode === 'FINISHED') {
+    var fr = d.finish_result || {};
+    var sdkParam = fr.sdk_param || d.sdk_param || '';
+    if (!sdkParam) {
+      return { ok: false, resultCode: 'NO_SDK', message: source + ' finish_result 缺少 sdk_param' };
+    }
+    var decoded = pb.decodeSdkParam(sdkParam);
+    var ep = pb.extractEndpoints(decoded);
+    return {
+      ok: true,
+      resultCode: 'FINISHED',
+      sdkParam: sdkParam,
+      sid: String(fr.sid || ep.sid || ''),
+      cloudProvider: fr.cloud_provider || '',
+      regionId: fr.region_id || '',
+      nodeId: fr.node_id || last.nodeId,
+      queueType: fr.queue_type || 'normal',
+      costMethod: fr.cost_method,
+      gameId: fr.game_id || '',
+      billingStarted: true,
+      decoded: decoded,
+      endpoints: ep
+    };
+  }
+  if (resultCode === 'QUEUED') {
+    var qi = d.queue_info || {};
+    return {
+      ok: false,
+      resultCode: 'QUEUED',
+      queueTicket: qi.ticket || '',
+      queryInterval: qi.query_interval || 0,
+      position: qi.position || qi.queue_value || 0,
+      total: qi.total || 0,
+      billingStarted: false,
+      message: '排队中（未开始计费）'
+    };
+  }
+  return { ok: false, resultCode: resultCode || 'UNKNOWN', message: source + ' 未完成: result_code=' + resultCode };
+}
+
+/* 发一次 paasDispatch（计费动作），返回解析结果。 */
+async function _dispatchOnce(opts) {
   var body = buildPaasBody({
     bitRate: opts.bitRate || last.bitRate,
     userData: opts.userData || buildUserData(),
@@ -433,50 +477,91 @@ export async function dispatchPaas(opts) {
   if (res.code !== 0 || !res.data) {
     throw login.bizError(res.code, 'paasDispatch failed: ' + res.code + ' ' + res.message);
   }
+  var parsed = _parseDispatchResult(res.data, 'paasDispatch');
+  if (parsed.resultCode === 'QUEUED') {
+    last.queueTicket = parsed.queueTicket || last.queueTicket;
+  }
+  return parsed;
+}
 
-  var d = res.data;
-  var resultCode = d.result_code || '';
+/* 轮询排队 ticket（yys 协议：QUEUED → 取 queue_info.{ticket,query_interval}，
+ * 轮询 getDispatchTicketInfo）。不产生计费，只读队列状态。 */
+async function _pollTicket(ticket) {
+  var base = { biz_key: BIZ_KEY, ticket: ticket };
+  var sign = http.hmacSha256(C.APP_KEY, login.signPayload(base));
+  var body = { biz_key: BIZ_KEY, ticket: ticket, sign: sign };
+  var res = await http.requestJson({
+    url: C.CLOUD_BASE + '/dispatcher/api/getDispatchTicketInfo',
+    method: 'POST',
+    headers: hdr({ 'content-type': 'application/json' }),
+    body: body,
+    timeoutMs: C.HTTP_TIMEOUT_MS,
+    cookieJarKey: login.jarKey()
+  });
+  if (res.code !== 0 || !res.data) {
+    return { ok: false, resultCode: 'POLL_ERR', message: res.message || ('poll ' + res.code) };
+  }
+  return _parseDispatchResult(res.data, 'getDispatchTicketInfo');
+}
 
-  /* QUEUED：排队中，拿 ticket 让上层轮询 / 或者直接 leaveQueue 放弃 */
-  if (resultCode === 'QUEUED') {
-    var qi = d.queue_info || {};
-    last.queueTicket = qi.ticket || '';
-    return {
-      ok: false,
-      resultCode: 'QUEUED',
-      queueTicket: last.queueTicket,
-      queryInterval: qi.query_interval || 0,
-      billingStarted: false,
-      message: '排队中（未开始计费）'
-    };
+/* 计费调度入口：发一次 paasDispatch，若 QUEUED 就轮询排队直到 FINISHED。
+ * 只有拿到 sdkParam（FINISHED）才真正开始计费；排队期间不扣费。
+ * opts.onProgress(p) 每次状态变化回调（给 UI 画「排队中 N 人」）。
+ * 返回 {ok:true, sdkParam,...} 或 {ok:false, resultCode:'QUEUE_TIMEOUT'/..., message}。 */
+export async function dispatchPaas(opts) {
+  opts = opts || {};
+  if (opts.confirmBilling !== true) {
+    throw new Error('BILLING_GUARD: paasDispatch 会开始计费，必须显式传 confirmBilling:true');
+  }
+  if (!last.nodeId || !last.regionIds) {
+    throw new Error('NO_NODE: 需要先调用 dispatch() 拿到 nodeId/regionIds');
   }
 
-  if (resultCode !== 'FINISHED') {
-    throw new Error('paasDispatch 未完成: result_code=' + resultCode);
+  var maxWaitMs = opts.maxWaitMs || 150000;
+  var deadline = Date.now() + maxWaitMs;
+  var onProgress = typeof opts.onProgress === 'function' ? opts.onProgress : function () {};
+
+  var r = await _dispatchOnce(opts);
+  onProgress(r);
+  if (r.resultCode !== 'QUEUED') return r;
+
+  var ticket = r.queueTicket || last.queueTicket;
+  var interval = r.queryInterval || 3;
+  while (Date.now() < deadline) {
+    if (interval < 2) interval = 2;
+    if (interval > 15) interval = 15;
+    await _sleep(interval * 1000);
+    if (Date.now() >= deadline) break;
+
+    var pr;
+    try { pr = await _pollTicket(ticket); }
+    catch (e) { pr = { ok: false, resultCode: 'POLL_ERR', message: String((e && e.message) || e) }; }
+    onProgress(pr);
+    if (pr.ok) return pr;
+
+    if (pr.resultCode === 'QUEUED') {
+      ticket = pr.queueTicket || ticket;
+      if (pr.queryInterval) interval = pr.queryInterval;
+    }
+    /* 其它（POLL_ERR/UNKNOWN/NO_SDK）：不盲目重新 dispatch（避免重置队列/重复计费），
+     * 只继续轮询。若 getDispatchTicketInfo 一直不给 sdkParam，到点后再发一次
+     * paasDispatch 作最后一次认领尝试。 */
   }
 
-  var fr = d.finish_result || {};
-  var sdkParam = fr.sdk_param || '';
-  if (!sdkParam) throw new Error('finish_result 缺少 sdk_param');
-
-  /* 解码 protobuf，把 session.c 需要的字段提出来 */
-  var decoded = pb.decodeSdkParam(sdkParam);
-  var ep = pb.extractEndpoints(decoded);
+  /* 收尾：再发一次 paasDispatch 认领实例（此时若队列已到，会直接 FINISHED）。 */
+  try {
+    var lastTry = await _dispatchOnce(opts);
+    onProgress(lastTry);
+    if (lastTry.resultCode !== 'QUEUED') return lastTry;
+    ticket = lastTry.queueTicket || ticket;
+  } catch (e) { /* 忽略，走超时返回 */ }
 
   return {
-    ok: true,
-    resultCode: 'FINISHED',
-    sdkParam: sdkParam,
-    sid: String(fr.sid || ep.sid || ''),
-    cloudProvider: fr.cloud_provider || '',
-    regionId: fr.region_id || '',
-    nodeId: fr.node_id || last.nodeId,
-    queueType: fr.queue_type || 'normal',
-    costMethod: fr.cost_method,
-    gameId: fr.game_id || '',
-    billingStarted: true,
-    decoded: decoded,
-    endpoints: ep
+    ok: false,
+    resultCode: 'QUEUE_TIMEOUT',
+    queueTicket: ticket,
+    billingStarted: false,
+    message: '排队超时（' + Math.round(maxWaitMs / 1000) + ' 秒仍未排到），请稍后再试'
   };
 }
 
