@@ -184,3 +184,28 @@ sh PenYS/scripts/device-verify.sh      # 在工作区根目录（含 PenYS/ 与 
 
 仍然需要人做的事：在设备上点「开始游戏」（触摸注入在这台机器上无效），或者临时把
 `DEV_AUTOSTART` 钩子加回 `bootTick()` 后重新打包。
+
+## 7. 拿一次浏览器的「一手对照」怎么做
+
+这一节是留给「ICE 仍然 no reply」时用的最后手段。我们复现不出服务端的行为时，
+唯一可靠的做法是让官方 web 客户端在同一网络下跑一次，把它真正发的包抓下来。
+
+**注意：这一步会真的申请云端实例、按分钟计费。** 只在对账号费用无异议时做。
+
+1. 在同一台 PC、同一个公网出口下，用 Chrome 打开 https://ys.mihoyo.com/cloud/ ，登录后
+   点开始游戏，等它出画面。
+2. 抓 `chrome://webrtc-internals`：里面能看到 offer/answer 全文、所有 local/remote
+   candidate、以及最终选中的 candidate pair。**重点看 remote candidate 被改写成什么**
+   （预期是 `gameSvrAddr` 的 IP + `rtcUdpPort`，这正是我们的做法），以及 answer 里
+   `m=` 端口、`a=candidate`、`a=ice-ufrag` 与浏览器实际发 STUN 的 5-tuple 是否一致。
+3. 抓包：Wireshark 选 PC 的物理网卡，过滤 `udp and ip.addr == <媒体IP>`。重点看
+   - 浏览器第一个 STUN Binding Request 的**目的端口**、USERNAME、以及服务端是否回
+     Binding Success；
+   - 如果服务端先发 check（ICE-lite 一般也允许），它的目的地址是谁；
+   - DTLS ClientHello 什么时候发、发往哪个 5-tuple、服务端有无 HelloVerifyRequest。
+4. 把 pcap 与 webrtc-internals 的文本一起存到 `.tmp/browser-capture/`，再用
+   `.tmp/stun_verify.js` 的方式逐字段对比我们的实现。
+
+对照要点（任意一条不同，就可能是静默丢包的原因）：
+`candidate 目的地址/端口`、`USERNAME` 的 `remote:local` 组成、`answer 里的 ufrag/pwd`、
+`DTLS 目标 5-tuple`、`m-line 端口`、以及服务端是否真的回 STUN。
