@@ -502,8 +502,12 @@ static int vp_build(ys_video_t *v) {
             snprintf(v->error_msg, sizeof v->error_msg, "build: gst_bin_add failed");
             goto fail;   /* e[0..k) 归 p，e[k..4] 归本函数 */
         }
+        {
+            char tag[40];
+            snprintf(tag, sizeof tag, "build/add[%d]", k);
+            vp_log_peer(tag, src);
+        }
     }
-    vp_log_peer("build/bin_add", src);
 
     /* ---- appsrc：Annex-B byte-stream AU；block=false 保证 push 永不阻塞 ---- */
     caps = gst_caps_from_string("video/x-h264,stream-format=(string)byte-stream,"

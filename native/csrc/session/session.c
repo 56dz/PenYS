@@ -922,9 +922,26 @@ static int w_run_session(void) {
             w_fail(YS_ERR_WSS, "wss_url 解析失败");
             return -1;
         }
-        /* The signalling endpoint always needs /rtc-sdk appended. sdk_param
-         * gives only wss://host, so this concatenation is not cosmetic. */
-        if (!strcmp(path, "/")) snprintf(path, sizeof(path), "/rtc-sdk");
+        /* The signalling endpoint always needs /rtc-sdk appended (yys
+         * pitfalls.md §11). game_server_wss_url already carries a path like
+         * /dg13-c1-86363-1/50202, so this is NOT just the bare-host case: we
+         * must append to whatever path is present. Mirrors the JS reference:
+         *   url.endsWith('/rtc-sdk') || (url += '/rtc-sdk');
+         * The old `if (!strcmp(path, "/"))` guard dropped the suffix whenever
+         * the server gave a real path -> upgrade rejected (HTTP 233). */
+        {
+            size_t n = strlen(path);
+            const char *sfx = "/rtc-sdk";
+            size_t sn = strlen(sfx);
+            if (n < sn || strcmp(path + n - sn, sfx) != 0) {
+                if (n + sn < sizeof(path)) {
+                    memcpy(path + n, sfx, sn + 1);
+                } else {
+                    w_fail(YS_ERR_WSS, "wss_url path too long");
+                    return -1;
+                }
+            }
+        }
         snprintf(url, sizeof(url), "wss://%s:%d%s", host, port, path);
         ys_logf("wss: connecting to %s", url);
 
