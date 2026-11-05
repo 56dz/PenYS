@@ -681,6 +681,17 @@ export default {
       this.bootHint = '正在检查登录状态…';
       await this.sleep(360);
       if (this._dead || myGen !== this._gen) return;
+      /* 冷启动先恢复会话：session 落在 falcon KV（storage.saveSession），
+       * cookie jar 落 /userdata/penys/ys_cookies.txt，两者都要 bootstrap 灌回来。
+       * 不调它 isLoggedIn() 读到的 state.session 恒为 null → 每次重启都要重扫。
+       * 恢复失败不算错（降级为重新扫码）。 */
+      try {
+        await ys.bootstrap();
+        logWarn('会话恢复: ' + (ys.isLoggedIn() ? 'ok' : 'none'));
+      } catch (e) {
+        logWarn('会话恢复异常: ' + ((e && e.message) || e));
+      }
+      if (this._dead || myGen !== this._gen) return;
       let logged = false;
       try {
         logged = !!ys.isLoggedIn();
@@ -950,12 +961,27 @@ export default {
         return;
       }
       if (this._dead || myGen !== this._gen) return;
-      const sdkParam = r && r.sdkParam;
+      let sdkParam = r && r.sdkParam;
       if (!sdkParam) {
-        /* 真实协议下 dispatch() 只跑到 getNodesInfo（sdkParam 为空），
-         * 真参要走 dispatchPaas({confirmBilling:true}) —— 那是计费动作，
-         * 必须等 lead 安排时间窗后由二次确认弹层显式触发，这里绝不自动发。 */
-        this.showError(-3001, '调度返回缺少 sdkParam（计费连接待开启，请联系管理员安排时间窗）', 'dispatch');
+        /* dispatch() 只跑到 getNodesInfo 不产生 sdkParam；真正的 paasDispatch
+         * 是计费动作，只有走到这里才发 —— 即用户已在二次确认弹层点了「确认开始」
+         * （那句「申请成功后会立刻开始计费」就是知情同意）。 */
+        try {
+          const p = await ys.dispatchPaas({ confirmBilling: true });
+          if (this._dead || myGen !== this._gen) return;
+          if (p && p.ok === false) {
+            this.showError(-3001, '计费调度排队中：' + (p.message || p.resultCode || ''), 'dispatch');
+            return;
+          }
+          sdkParam = p && p.sdkParam;
+        } catch (e) {
+          if (this._dead || myGen !== this._gen) return;
+          this.showError(-3001, '计费调度失败：' + ((e && e.message) || '未知错误'), 'dispatch');
+          return;
+        }
+      }
+      if (!sdkParam) {
+        this.showError(-3001, '调度返回缺少 sdkParam', 'dispatch');
         return;
       }
       this.dispStep = 3;

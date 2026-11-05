@@ -121,6 +121,8 @@ extern gulong gst_pad_add_probe(GstPad *pad, int mask,
                                 GstPadProbeReturn (*callback)(GstPad *, GstPadProbeInfo *, void *),
                                 void *user_data, void (*destroy_data)(void *));
 extern GstCaps *gst_pad_get_current_caps(GstPad *pad);
+extern GstPad *gst_pad_get_peer(GstPad *pad);
+extern const char *gst_pad_get_name(GstPad *pad);
 extern GstCaps *gst_caps_from_string(const char *string);
 extern GstStructure *gst_caps_get_structure(const GstCaps *caps, unsigned int index);
 extern void gst_caps_unref(GstCaps *caps);
@@ -447,6 +449,17 @@ static GstPadProbeReturn vp_on_sink_buf(GstPad *pad, GstPadProbeInfo *info, void
 /* 管线构建                                                                */
 /* ====================================================================== */
 
+static void vp_log_peer(const char *tag, GstElement *el) {
+    GstPad *sp = el ? gst_element_get_static_pad(el, "src") : NULL;
+    if (!sp) { ys_logf("video: diag %s: no src pad", tag); return; }
+    {
+        GstPad *peer = gst_pad_get_peer(sp);
+        ys_logf("video: diag %s: peer=%s", tag, peer ? "OK" : "NULL");
+        if (peer) gst_object_unref(peer);
+    }
+    gst_object_unref(sp);
+}
+
 static int vp_build(ys_video_t *v) {
     static int gst_ready = 0;
     GstElement *p = NULL, *src = NULL, *parse = NULL, *dec = NULL, *q = NULL, *sink = NULL;
@@ -481,12 +494,16 @@ static int vp_build(ys_video_t *v) {
         snprintf(v->error_msg, sizeof v->error_msg, "build: gst_element_link failed");
         goto fail;   /* 尚未入 bin：fail 路径把 5 个元素全部释放 */
     }
+    {   /* 诊断：链接后立刻验证 vsrc:src 的 peer 是否真的挂上了 */
+        vp_log_peer("build/link", src);
+    }
     for (k = 0; k < 5; k++) {
         if (!gst_bin_add((GstBin *)p, e[k])) {
             snprintf(v->error_msg, sizeof v->error_msg, "build: gst_bin_add failed");
             goto fail;   /* e[0..k) 归 p，e[k..4] 归本函数 */
         }
     }
+    vp_log_peer("build/bin_add", src);
 
     /* ---- appsrc：Annex-B byte-stream AU；block=false 保证 push 永不阻塞 ---- */
     caps = gst_caps_from_string("video/x-h264,stream-format=(string)byte-stream,"
@@ -505,6 +522,7 @@ static int vp_build(ys_video_t *v) {
     /* 读回真实上限：set 若被属性拒绝，push 侧按真实值预判，永远不会撞上反压 */
     g_object_get(src, "max-bytes", &mb, NULL);
     v->queue_max = mb ? mb : VP_QUEUE_FALLBACK;
+    vp_log_peer("build/src-props", src);
 
     /* ---- 解码器（rtpprobe 真机配方） ---- */
     g_object_set(dec, "fast-mode", 1, "ignore-error", 0, "max-errors", 16, NULL);
@@ -529,6 +547,7 @@ static int vp_build(ys_video_t *v) {
         gst_pad_add_probe(pad, GST_PAD_PROBE_TYPE_BUFFER, vp_on_sink_buf, v, NULL);
         gst_object_unref(pad);
     }
+    vp_log_peer("build/probes", src);
 
     v->pipeline = p;
     v->appsrc = src;
@@ -614,11 +633,16 @@ int ys_video_start(ys_video_t *v, int preroll_timeout_ms) {
         ys_logf("video: %s", v->error_msg);
         return -1;
     }
+    vp_log_peer("start/after-PAUSED", v->appsrc);
     r = gst_element_set_state(v->pipeline, GST_STATE_PLAYING);
     if (r == GST_STATE_CHANGE_FAILURE) {
         snprintf(v->error_msg, sizeof v->error_msg, "set_state(PLAYING) -> FAILURE");
         ys_logf("video: %s", v->error_msg);
         return -1;
+    }
+    {   /* 诊断：状态切换后 peer 是否还在 */
+        vp_log_peer("start/after-PLAYING", v->appsrc);
+        ys_logf("video: diag start: state_ret=%d", (int)r);
     }
 
     if (preroll_timeout_ms <= 0) {
@@ -755,7 +779,16 @@ int ys_video_push_video(ys_video_t *v, const uint8_t *annexb, size_t len, uint32
     gst_buffer_unref(buf);
 
     if (flow != GST_FLOW_OK) {
+        static int vp_pf;
         __atomic_add_fetch(&v->dropped, 1, __ATOMIC_RELAXED);
+        if (__atomic_add_fetch(&vp_pf, 1, __ATOMIC_RELAXED) <= 3) {
+            GstPad *sp = gst_element_get_static_pad(v->appsrc, "src");
+            GstPad *peer = sp ? gst_pad_get_peer(sp) : NULL;
+            ys_logf("video: diag push: flow=%d peer=%s",
+                    (int)flow, peer ? "OK" : "NULL");
+            if (peer) gst_object_unref(peer);
+            if (sp) gst_object_unref(sp);
+        }
         return -1;
     }
     {

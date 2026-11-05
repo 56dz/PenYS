@@ -117,6 +117,7 @@ export function logout() { return call('logout'); }
 export function fetchWallet() { return call('fetchWallet'); }
 export function fetchGears() { return call('fetchGears'); }
 export function dispatch(o) { return call('dispatch', o); }
+export function dispatchPaas(o) { return call('dispatchPaas', o); }
 export function leaveQueue() { return call('leaveQueue'); }
 
 export function isLoggedIn() {
