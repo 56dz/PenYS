@@ -135,6 +135,15 @@ export function queueSnapshot() {
   return {};
 }
 
+/* 当前登录会话（含 aid）。真实层有 getSession 就用，mock 层没有就返回 null。
+ * aid 是 native 的 StartGameReq 必需字段，起播路径要它，所以这里必须能读到。 */
+export function getSession() {
+  if (active && typeof active.getSession === 'function') {
+    try { return active.getSession() || null; } catch (e) { return null; }
+  }
+  return null;
+}
+
 /* 冷启动恢复会话（把落盘 cookie jar 灌回 native）。
  * 失败不算错：只是需要重新扫码。 */
 export function bootstrap() {

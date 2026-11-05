@@ -17,6 +17,7 @@
 #include "sig.h"
 #include "wss.h"
 #include "sdp.h"
+#include "core/log.h"
 
 #include <errno.h>
 #include <stdarg.h>
@@ -37,6 +38,14 @@ struct sig {
     char cfg_fp[256];
     char cfg_cand_ip[64];
     char cfg_local_ip[64];
+
+    /* StartGameReq strings. Same idea as the buffers above: the caller's
+     * storage may die the moment sig_create() returns. */
+    char cfg_game_token[512];
+    char cfg_account_id[128];
+    char cfg_sid[256];
+    char cfg_pod_id[256];
+    char cfg_sdk_version[64];
 
     char host[256];
     int  port;
@@ -64,6 +73,19 @@ struct sig {
     int  closing;
     int  poll_depth;       /* re-entrancy guard for callbacks */
 
+    int  hello_sent;       /* client hello already on the wire              */
+    int  start_rsp_ok;     /* StartGameRsp with retcode==RtcSucc arrived    */
+    int  start_rsp_code;   /* last retcode seen, for the error message      */
+    long long t_start_game_ms;  /* when StartGameReq went out                */
+
+    /* ICE short-term credentials of the current negotiation. The session's
+     * STUN layer needs all four: USERNAME is remote:local, MESSAGE-INTEGRITY
+     * is keyed with the remote pwd, and the responses are keyed with ours. */
+    char local_ice_ufrag[64];
+    char local_ice_pwd[128];
+    char remote_ice_ufrag[64];
+    char remote_ice_pwd[128];
+
     char err[256];
 };
 
@@ -84,6 +106,7 @@ static void set_err(sig_conn_t *s, const char *fmt, ...)
     vsnprintf(s->err, sizeof(s->err), fmt, ap);
     va_end(ap);
     s->err[sizeof(s->err) - 1] = 0;
+    ys_logf("sig: err: %s", s->err);
 }
 
 const char *sig_last_error(const sig_conn_t *s)
@@ -318,6 +341,15 @@ static void copy_cfg_strings(sig_conn_t *s, const sig_cfg_t *cfg)
              cfg->candidate_ip ? cfg->candidate_ip : "");
     snprintf(s->cfg_local_ip, sizeof(s->cfg_local_ip), "%s",
              cfg->local_ip ? cfg->local_ip : "");
+    snprintf(s->cfg_game_token, sizeof(s->cfg_game_token), "%s",
+             cfg->game_token ? cfg->game_token : "");
+    snprintf(s->cfg_account_id, sizeof(s->cfg_account_id), "%s",
+             cfg->account_id ? cfg->account_id : "");
+    snprintf(s->cfg_sid, sizeof(s->cfg_sid), "%s", cfg->sid ? cfg->sid : "");
+    snprintf(s->cfg_pod_id, sizeof(s->cfg_pod_id), "%s",
+             cfg->pod_id ? cfg->pod_id : "");
+    snprintf(s->cfg_sdk_version, sizeof(s->cfg_sdk_version), "%s",
+             cfg->sdk_version ? cfg->sdk_version : "");
 
     s->cfg = *cfg;
     s->cfg.url = s->cfg_url;
@@ -325,6 +357,304 @@ static void copy_cfg_strings(sig_conn_t *s, const sig_cfg_t *cfg)
     s->cfg.fingerprint = s->cfg_fp[0] ? s->cfg_fp : NULL;
     s->cfg.candidate_ip = s->cfg_cand_ip[0] ? s->cfg_cand_ip : NULL;
     s->cfg.local_ip = s->cfg_local_ip[0] ? s->cfg_local_ip : NULL;
+    s->cfg.game_token = s->cfg_game_token;
+    s->cfg.account_id = s->cfg_account_id;
+    s->cfg.sid = s->cfg_sid;
+    s->cfg.pod_id = s->cfg_pod_id;
+    s->cfg.sdk_version = s->cfg_sdk_version;
+}
+
+/* --------------------------------------------------- StartGameReq / Rsp --
+ *
+ * Why this exists at all is worth writing down, because the old header of
+ * this file described a handshake that does not happen.
+ *
+ * "client hello" alone is NOT enough to make the service send an offer. The
+ * reference client sends it only AFTER the game pod has acknowledged that it
+ * is booting our session. The order is
+ *
+ *     WSS up
+ *       -> type-2 proxy frame carrying StartGameReq(20001)
+ *       -> type-2 proxy frame carrying StartGameRsp(20002), retcode==1
+ *       -> type-3 "client hello"
+ *       -> type-1 {"type":"offer","sdp":...}
+ *
+ * If we skip straight to client hello the server replies with exactly one
+ * `{"type":"server hello","session_id":1}` -- which is not a prompt, it only
+ * carries the id the reference client uses on the separate :5443 control
+ * channel -- and then never speaks again. That is the NO_OFFER hang.
+ */
+
+typedef struct {
+    unsigned char *buf;
+    size_t cap;
+    size_t len;
+    int    ok;
+} pb_w;
+
+static void pb_w_bytes(pb_w *w, const void *p, size_t n)
+{
+    if (!w->ok || w->len + n > w->cap) { w->ok = 0; return; }
+    memcpy(w->buf + w->len, p, n);
+    w->len += n;
+}
+
+static void pb_w_varint(pb_w *w, unsigned long long v)
+{
+    unsigned char tmp[10];
+    size_t n = 0;
+
+    while (v >= 0x80) {
+        tmp[n++] = (unsigned char)((v & 0x7F) | 0x80);
+        v >>= 7;
+    }
+    tmp[n++] = (unsigned char)(v & 0x7F);
+    pb_w_bytes(w, tmp, n);
+}
+
+static void pb_w_key(pb_w *w, int field, int wire_type)
+{
+    pb_w_varint(w, ((unsigned long long)field << 3) | (unsigned)wire_type);
+}
+
+/* proto3 semantics: empty strings and zero numbers are omitted entirely. */
+static void pb_w_str(pb_w *w, int field, const char *s)
+{
+    size_t n;
+    if (!s || !s[0]) return;
+    n = strlen(s);
+    pb_w_key(w, field, 2);
+    pb_w_varint(w, (unsigned long long)n);
+    pb_w_bytes(w, s, n);
+}
+
+static void pb_w_u32(pb_w *w, int field, unsigned int v)
+{
+    if (v == 0) return;
+    pb_w_key(w, field, 0);
+    pb_w_varint(w, v);
+}
+
+/* Wrap `msg` in a Packet: magic | cmd_id | head_len | msg_len | msg | tail.
+ * Head is always empty here, so the envelope is exactly 12 + msg_len bytes. */
+static size_t packet_pack(int cmd, const unsigned char *msg, size_t msg_len,
+                          unsigned char *out, size_t cap)
+{
+    size_t total = SIG_PACKET_MIN_SIZE + msg_len;
+
+    if (!out || total > cap) return 0;
+
+    out[0] = (unsigned char)(SIG_PACKET_MAGIC_HEAD >> 8);
+    out[1] = (unsigned char)(SIG_PACKET_MAGIC_HEAD & 0xFF);
+    out[2] = (unsigned char)((cmd >> 8) & 0xFF);
+    out[3] = (unsigned char)(cmd & 0xFF);
+    out[4] = 0;                                   /* head_len = 0 */
+    out[5] = 0;
+    out[6] = (unsigned char)((msg_len >> 24) & 0xFF);
+    out[7] = (unsigned char)((msg_len >> 16) & 0xFF);
+    out[8] = (unsigned char)((msg_len >> 8) & 0xFF);
+    out[9] = (unsigned char)(msg_len & 0xFF);
+    if (msg_len)
+        memcpy(out + 10, msg, msg_len);
+    out[total - 2] = (unsigned char)(SIG_PACKET_MAGIC_TAIL >> 8);
+    out[total - 1] = (unsigned char)(SIG_PACKET_MAGIC_TAIL & 0xFF);
+    return total;
+}
+
+/* Read the first varint out of a protobuf message; used for StartGameRsp's
+ * retcode (field 1, int32). Returns 0 on success. */
+static int pb_first_varint_field(const unsigned char *p, size_t n,
+                                 int want_field, long long *out)
+{
+    size_t i = 0;
+
+    while (i < n) {
+        unsigned long long key = 0;
+        int shift = 0;
+        int field, wt;
+
+        while (i < n) {
+            unsigned char b = p[i++];
+            key |= (unsigned long long)(b & 0x7F) << shift;
+            shift += 7;
+            if (!(b & 0x80)) break;
+            if (shift > 63) return -1;
+        }
+        field = (int)(key >> 3);
+        wt = (int)(key & 7);
+
+        if (wt == 0) {
+            unsigned long long v = 0;
+            int s2 = 0;
+            while (i < n) {
+                unsigned char b = p[i++];
+                v |= (unsigned long long)(b & 0x7F) << s2;
+                s2 += 7;
+                if (!(b & 0x80)) break;
+                if (s2 > 63) return -1;
+            }
+            if (field == want_field) {
+                *out = (long long)v;
+                return 0;
+            }
+        } else if (wt == 2) {
+            unsigned long long l = 0;
+            int s2 = 0;
+            while (i < n) {
+                unsigned char b = p[i++];
+                l |= (unsigned long long)(b & 0x7F) << s2;
+                s2 += 7;
+                if (!(b & 0x80)) break;
+                if (s2 > 63) return -1;
+            }
+            if (l > (unsigned long long)(n - i)) return -1;
+            i += (size_t)l;
+        } else if (wt == 5) {
+            if (i + 4 > n) return -1;
+            i += 4;
+        } else if (wt == 1) {
+            if (i + 8 > n) return -1;
+            i += 8;
+        } else {
+            return -1;              /* groups are not used by this protocol */
+        }
+    }
+    return -1;
+}
+
+/* Build + queue a StartGameReq. Returns 0 on success. */
+static int send_start_game(sig_conn_t *s)
+{
+    unsigned char msg[1024];
+    unsigned char *pkt;
+    size_t total;
+    pb_w w;
+    long long now = now_ms();
+    long long since_start_sec;
+    long long link_ms;
+    int rc;
+
+    if (!s || !s->wss) return -1;
+
+    since_start_sec = (s->t_start_game_ms > 0)
+        ? (now - s->t_start_game_ms) / 1000 : 0;
+    link_ms = (s->t_open_ms > 0) ? (now - s->t_open_ms) : 0;
+
+    w.buf = msg;
+    w.cap = sizeof(msg);
+    w.len = 0;
+    w.ok = 1;
+
+    pb_w_str(&w, 1, s->cfg.game_token);
+    pb_w_str(&w, 2, s->cfg.account_id);
+    pb_w_str(&w, 3, s->cfg.sdk_version);
+    pb_w_u32(&w, 4, (unsigned)s->cfg.terminal_type);
+    pb_w_str(&w, 6, s->cfg.sid);
+    pb_w_str(&w, 7, s->cfg.pod_id);
+    pb_w_u32(&w, 8, 0);            /* has_rtc_connected: no DTLS yet     */
+    pb_w_u32(&w, 9, (unsigned)since_start_sec);
+    pb_w_u32(&w, 10, (unsigned)link_ms);
+    /* field 12 game_config: an empty SdkGameConfig serialises to zero bytes,
+     * so the reference client's message would be written as tag+len 0. It is
+     * optional in practice; omit it rather than send a degenerate message. */
+
+    if (!w.ok) {
+        set_err(s, "StartGameReq: message too large");
+        return -1;
+    }
+
+    s->t_start_game_ms = now;
+
+    pkt = (unsigned char *)malloc(SIG_PACKET_MIN_SIZE + w.len);
+    if (!pkt) {
+        set_err(s, "StartGameReq: out of memory");
+        return -1;
+    }
+    total = packet_pack(SIG_CMD_START_GAME_REQ, msg, w.len, pkt,
+                        SIG_PACKET_MIN_SIZE + w.len);
+    if (total == 0) {
+        free(pkt);
+        set_err(s, "StartGameReq: packet_pack failed");
+        return -1;
+    }
+
+    rc = sig_send(s, SIG_TYPE_PROXY, pkt, total);
+    free(pkt);
+    if (rc != 0) {
+        set_err(s, "StartGameReq: %s", wss_error(s->wss));
+        set_state(s, SIG_STATE_FAILED);
+        return -1;
+    }
+
+    ys_logf("sig: StartGameReq sent (%zu bytes, sid=%s pod=%s aid=%s sdk=%s)",
+            total, s->cfg.sid, s->cfg.pod_id, s->cfg.account_id,
+            s->cfg.sdk_version);
+    return 0;
+}
+
+/* Send the type-3 client hello. Guarded so it can never go out twice. */
+static int send_client_hello(sig_conn_t *s)
+{
+    static const char hello[] =
+        "{\"client_type\":\"web\",\"type\":\"client hello\"}";
+
+    if (!s || !s->wss) return -1;
+    if (s->hello_sent) return 0;
+    if (sig_send(s, SIG_TYPE_HANDSHAKE, hello, sizeof(hello) - 1) != 0) {
+        set_err(s, "client hello: %s", wss_error(s->wss));
+        set_state(s, SIG_STATE_FAILED);
+        return -1;
+    }
+    s->hello_sent = 1;
+    ys_logf("sig: client hello sent");
+    return 0;
+}
+
+/* Handle one type-2 payload. Returns 1 if it was a Packet we understood (the
+ * caller then swallows it), 0 if it is opaque and should be forwarded. */
+static int handle_packet(sig_conn_t *s, const unsigned char *p, size_t n)
+{
+    unsigned int magic;
+    int cmd;
+    unsigned long msg_len;
+
+    if (!s || !p || n < SIG_PACKET_MIN_SIZE) return 0;
+
+    magic = ((unsigned)p[0] << 8) | (unsigned)p[1];
+    if (magic != SIG_PACKET_MAGIC_HEAD) return 0;
+
+    cmd = ((int)p[2] << 8) | (int)p[3];
+    msg_len = ((unsigned long)p[6] << 24) | ((unsigned long)p[7] << 16) |
+              ((unsigned long)p[8] << 8) | (unsigned long)p[9];
+
+    {
+        size_t head_len = ((size_t)p[4] << 8) | (size_t)p[5];
+        size_t want = 12 + head_len + (size_t)msg_len;
+        unsigned int tail = ((unsigned)p[n - 2] << 8) | (unsigned)p[n - 1];
+        const unsigned char *msg = p + 10 + head_len;
+
+        if (want != n) return 0;
+        if (tail != (SIG_PACKET_MAGIC_TAIL & 0xFFFFu)) return 0;
+
+        if (cmd == SIG_CMD_START_GAME_RSP) {
+            long long code = 0;
+            if (pb_first_varint_field(msg, (size_t)msg_len, 1, &code) != 0)
+                code = 0;
+            s->start_rsp_code = (int)code;
+            ys_logf("sig: StartGameRsp retcode=%d", (int)code);
+            if ((int)code == SIG_START_GAME_SUCC) {
+                s->start_rsp_ok = 1;
+                send_client_hello(s);
+            } else {
+                set_err(s, "StartGameRsp retcode=%d", (int)code);
+                set_state(s, SIG_STATE_FAILED);
+            }
+            return 1;
+        }
+
+        ys_logf("sig: proxy packet cmd=%d len=%lu (ignored)", cmd, msg_len);
+        return 1;
+    }
 }
 
 sig_conn_t *sig_create(const sig_cfg_t *cfg)
@@ -363,8 +693,6 @@ sig_conn_t *sig_create(const sig_cfg_t *cfg)
 
 int sig_open(sig_conn_t *s)
 {
-    static const char hello[] = "{\"client_type\":\"web\",\"type\":\"client hello\"}";
-
     if (!s) return -1;
     if (s->wss || s->state == SIG_STATE_OPEN) {
         set_err(s, "sig_open: already open");
@@ -385,11 +713,20 @@ int sig_open(sig_conn_t *s)
     s->t_open_ms = now_ms();
     s->t_last_rx_ms = s->t_open_ms;
     s->t_last_hb_ms = s->t_open_ms;
+    s->hello_sent = 0;
+    s->start_rsp_ok = 0;
+    s->start_rsp_code = 0;
 
-    if (sig_send(s, SIG_TYPE_HANDSHAKE, hello, sizeof(hello) - 1) != 0) {
-        set_err(s, "client hello: %s", wss_error(s->wss));
-        set_state(s, SIG_STATE_FAILED);
-        return -1;
+    if (s->cfg.game_token && s->cfg.game_token[0]) {
+        /* Real service: ask the pod to boot our game first. The client hello
+         * goes out later, from handle_packet(), once StartGameRsp says OK. */
+        if (send_start_game(s) != 0)
+            return -1;
+    } else {
+        /* No token (mock server, or a caller that predates this exchange):
+         * keep the old behaviour rather than hanging forever. */
+        if (send_client_hello(s) != 0)
+            return -1;
     }
 
     set_state(s, SIG_STATE_OPEN);
@@ -575,6 +912,16 @@ int sig_build_answer(sig_conn_t *s, char *out, size_t cap)
         set_err(s, "offer parse failed: %s", err);
         return -1;
     }
+    {
+        /* The ICE layer runs outside this file, so remember the peer's
+         * credentials while the parsed offer is still alive. */
+        const char *ru = sdp_session_ice_ufrag(o);
+        const char *rp = sdp_session_ice_pwd(o);
+        snprintf(s->remote_ice_ufrag, sizeof(s->remote_ice_ufrag), "%s",
+                 ru ? ru : "");
+        snprintf(s->remote_ice_pwd, sizeof(s->remote_ice_pwd), "%s",
+                 rp ? rp : "");
+    }
 
     memset(&cfg, 0, sizeof(cfg));
     cfg.local_ip = s->cfg.local_ip;
@@ -587,6 +934,10 @@ int sig_build_answer(sig_conn_t *s, char *out, size_t cap)
     cfg.accept_datachannel = s->cfg.accept_datachannel;
     cfg.candidate_ip = s->cfg.candidate_ip;
     cfg.candidate_port = s->cfg.candidate_port;
+    cfg.ice_ufrag_out = s->local_ice_ufrag;
+    cfg.ice_ufrag_out_cap = sizeof(s->local_ice_ufrag);
+    cfg.ice_pwd_out = s->local_ice_pwd;
+    cfg.ice_pwd_out_cap = sizeof(s->local_ice_pwd);
 
     n = sdp_build_answer(o, &cfg, out, cap, err, sizeof(err));
     if (n > 0) {
@@ -735,6 +1086,12 @@ static void handle_json(sig_conn_t *s, const char *json)
         set_err(s, "JSON frame without a \"type\" field");
         return;
     }
+    ys_logf("sig: json type=%s", type);
+    {
+        char peek[241];
+        snprintf(peek, sizeof(peek), "%s", json);
+        ys_logf("sig: json body: %s", peek);
+    }
 
     if (strcmp(type, "offer") == 0) {
         handle_offer(s, json);
@@ -769,6 +1126,7 @@ static void on_wss_msg(wss_t *h, int opcode, const unsigned char *data,
         return;                     /* PING/PONG are handled inside wss.c */
 
     s->t_last_rx_ms = now_ms();
+    ys_logf("sig: rx op=%d len=%zu", opcode, len);
 
     /* A bare empty frame is the peer's keepalive echo: ignore it. */
     if (len == 0)
@@ -794,6 +1152,7 @@ static void on_wss_msg(wss_t *h, int opcode, const unsigned char *data,
             off += used;
             frames++;
             s->frames_rx++;
+            ys_logf("sig: frame #%d type=%d len=%zu", frames, type, plen);
 
             if (type == SIG_TYPE_SIGNALING || type == SIG_TYPE_HANDSHAKE) {
                 /* Both are JSON; the payload is not NUL terminated. */
@@ -803,6 +1162,9 @@ static void on_wss_msg(wss_t *h, int opcode, const unsigned char *data,
                 j[plen] = 0;
                 handle_json(s, j);
                 free(j);
+            } else if (type == SIG_TYPE_PROXY &&
+                       handle_packet(s, pl, plen)) {
+                /* Consumed: it was a Packet envelope we understand. */
             } else if (s->cfg.cbs.on_bytes) {
                 s->cfg.cbs.on_bytes(s, type, pl, plen, s->cfg.user);
             }
@@ -933,6 +1295,26 @@ int sig_audio_payload_type(const sig_conn_t *s)
 const char *sig_current_offer(const sig_conn_t *s)
 {
     return (s && s->offer_len) ? s->offer : "";
+}
+
+const char *sig_local_ice_ufrag(const sig_conn_t *s)
+{
+    return s ? s->local_ice_ufrag : "";
+}
+
+const char *sig_local_ice_pwd(const sig_conn_t *s)
+{
+    return s ? s->local_ice_pwd : "";
+}
+
+const char *sig_remote_ice_ufrag(const sig_conn_t *s)
+{
+    return s ? s->remote_ice_ufrag : "";
+}
+
+const char *sig_remote_ice_pwd(const sig_conn_t *s)
+{
+    return s ? s->remote_ice_pwd : "";
 }
 
 int sig_fd(const sig_conn_t *s)

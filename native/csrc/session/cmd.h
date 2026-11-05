@@ -58,13 +58,20 @@ typedef enum {
     YS_CMD_RELEASE = 7
 } ys_cmd_type;
 
-/* START body. `sdk` is NUL terminated, so the struct is variable-length in
- * practice; senders must send sizeof(header) + strlen(sdk) + 1 and receivers
- * must bounds-check against cmd->len. */
+/* START body. `sdk` is NUL terminated and immediately followed by `aid`,
+ * also NUL terminated, so the struct is variable-length in practice; senders
+ * must send sizeof(header) + strlen(sdk) + 1 + strlen(aid) + 1 and receivers
+ * must bounds-check against cmd->len.
+ *
+ * `aid` is the gamer account id (gamer/api/login .aid). The signaling layer
+ * needs it for StartGameReq field 2 -- without it the server has no idea whose
+ * game to boot and never answers. It cannot ride inside sdk_param because
+ * sdk_param is minted by the dispatch service and does not contain it. */
 typedef struct {
     int32_t rect_x, rect_y, rect_w, rect_h;   /* logical canvas coords */
     int32_t sdk_len;                          /* excludes the NUL */
-    char    sdk[1];                           /* sdk_len bytes + NUL */
+    int32_t aid_len;                          /* excludes the NUL, 0 = none */
+    char    sdk[1];                           /* sdk_len bytes + NUL, then aid */
 } ys_cmd_start;
 
 typedef struct {
@@ -79,9 +86,12 @@ typedef struct {
     int32_t finger_id;   /* caller's stable identifier, NOT the wire slot */
 } ys_cmd_touch;
 
-/* Convenience: the byte length of a START command for a given sdk_param. */
-static inline int ys_cmd_start_len(int sdk_len) {
-    return (int)(sizeof(ys_cmd_start) + (sdk_len > 0 ? sdk_len : 0));
+/* Convenience: the byte length of a START command for a given sdk_param and
+ * account id (both excluding their NULs). */
+static inline int ys_cmd_start_len(int sdk_len, int aid_len) {
+    return (int)(sizeof(ys_cmd_start)
+                 + (sdk_len > 0 ? sdk_len : 0)
+                 + (aid_len > 0 ? aid_len : 0) + 1);
 }
 
 #ifdef __cplusplus

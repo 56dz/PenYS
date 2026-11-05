@@ -2,13 +2,24 @@
  *
  * Owns the whole handshake sequence the service expects:
  *
- *   WSS connect -> send "client hello" (type 3)
+ *   WSS connect -> send StartGameReq  (type 2 proxy frame, protobuf cmd 20001)
+ *              -> receive StartGameRsp (type 2 proxy frame, cmd 20002,
+ *                                       retcode must be 1 / RtcSucc)
+ *              -> send "client hello"  (type 3)
  *              -> receive an SDP offer (type 1)
  *              -> build + send the answer (type 1)
  *              -> receive remote candidates (type 1), rewrite them to the
  *                 fixed game-server address, hand them to the caller
  *              -> send our own candidates
  *              -> keep the session alive with a bare empty frame every 10 s
+ *
+ * The first two steps are the ones that matter and the ones this project got
+ * wrong for a long time: with only "client hello" on the wire the server
+ * answers with a single `{"type":"server hello","session_id":1}` and then goes
+ * completely silent, so the client sits in NO_OFFER forever. server hello is
+ * NOT a prompt to continue -- the official SDK only uses its session_id to
+ * open the separate :5443 control channel. The conversation cannot start until
+ * the game pod is told which game to start, and that is StartGameReq.
  *
  * There is NO internal thread and NO timer thread. Everything is driven by
  * the caller's single worker loop:
@@ -46,9 +57,40 @@ extern "C" {
  * WebSocket frame (the reference client does `websocket.send("")`).
  */
 #define SIG_TYPE_SIGNALING 1   /* JSON: SDP + ICE, both directions          */
-#define SIG_TYPE_PROXY     2   /* opaque bytes, forwarded to the media path */
+#define SIG_TYPE_PROXY     2   /* Packet() frames: StartGameReq/Rsp, etc.   */
 #define SIG_TYPE_HANDSHAKE 3   /* JSON: client hello / server hello         */
 #define SIG_TYPE_KEEPALIVE 4   /* header-carrying explicit keepalive        */
+
+/* ------------------------------------------------------- StartGame exchange
+ *
+ * A type-2 payload is not opaque here: it is a `Packet` protobuf envelope
+ * (game_sdk/protocol.cpp in the reference client):
+ *
+ *   [0..1]  magic head 0x4567 (17767)
+ *   [2..3]  cmd_id, big endian
+ *   [4..5]  head_len, big endian (0 for everything we send)
+ *   [6..9]  msg_len, 32-bit big endian
+ *   [10..]  PacketHead (head_len bytes; empty for us) followed by msg
+ *   [-2..]  magic tail 0x89AB (35243)
+ *
+ * so a headless packet is exactly 12 + msg_len bytes.
+ *
+ * StartGameReq (cmd 20001), proto3 so empty/zero fields are simply omitted:
+ *   1 game_token (string)   2 aid (string)        3 sdk_version (string)
+ *   4 terminal_type (uint32) 5 offline_mock_info   6 sid (string)
+ *   7 pod_id (string)        8 has_rtc_connected   9 since_start_sec
+ *  10 link_tasks_ms         11 mock_game_mode     12 game_config (message)
+ *
+ * StartGameRsp (cmd 20002): 1 retcode (int32), 2 game_app_id (uint32),
+ *   3 game_config (message). retcode == 1 (RtcSucc) means "the pod is booting
+ *   your game, go ahead and negotiate".
+ */
+#define SIG_PACKET_MAGIC_HEAD 0x4567
+#define SIG_PACKET_MAGIC_TAIL 0x89AB
+#define SIG_PACKET_MIN_SIZE   12
+#define SIG_CMD_START_GAME_REQ 20001
+#define SIG_CMD_START_GAME_RSP 20002
+#define SIG_START_GAME_SUCC    1       /* ResultCode::RtcSucc */
 
 #define SIG_FRAME_HEADER 8
 
@@ -136,6 +178,26 @@ typedef struct {
     int heartbeat_ms;        /* bare-frame keepalive period, default 10000   */
     int stale_ms;            /* silence before SIG_STATE_STALE, default 30000*/
 
+    /* ---- StartGameReq fields (see the note above SIG_TYPE_PROXY) ----
+     *
+     * The reference client does NOT send "client hello" as its first action on
+     * the signaling socket. The first thing it sends is a type-2 proxy frame
+     * carrying a protobuf StartGameReq(20001); only after the server answers
+     * StartGameRsp(20002) with retcode==RtcSucc does it create the RTCPeer-
+     * Connection and send "client hello" (frame type 3) -- and only then does
+     * the server push an offer.
+     *
+     * If game_token is empty the machine keeps the OLD behaviour (immediate
+     * client hello). That path is still useful against a mock/test server, and
+     * it keeps this change from breaking anything that cannot supply a token.
+     */
+    const char *game_token;  /* sdk_param field 4, "game_token"        */
+    const char *account_id;  /* gamer/api/login .aid (StartGameReq 2)   */
+    const char *sid;         /* sdk_param field 1                       */
+    const char *pod_id;      /* sdk_param field 3                       */
+    const char *sdk_version; /* CG_SDK_VERSION, default "6.1.0.65"      */
+    int         terminal_type;/* ClientTerminalType, default 9 (WebTouch)*/
+
     sig_cbs_t cbs;
     void *user;
 } sig_cfg_t;
@@ -146,7 +208,12 @@ typedef struct {
  * Does no I/O. */
 sig_conn_t *sig_create(const sig_cfg_t *cfg);
 
-/* Connect the WSS socket and send "client hello".
+/* Connect the WSS socket and kick off the game-start exchange.
+ *
+ * With cfg->game_token set this sends StartGameReq and WAITS (asynchronously,
+ * from sig_poll()) for StartGameRsp before the client hello goes out. Without
+ * a token it does the old thing: client hello immediately.
+ *
  * BLOCKS for the duration of the TLS + upgrade exchange (measured 222-263 ms
  * against the real service), so call it from the worker thread, not from a
  * latency-critical callback. Returns 0 on success, -1 on failure
@@ -214,6 +281,15 @@ int sig_video_payload_type(const sig_conn_t *s);
 int sig_audio_payload_type(const sig_conn_t *s);
 
 const char *sig_current_offer(const sig_conn_t *s);
+
+/* ICE short-term credentials of the current negotiation, valid once an answer
+ * has been built. The STUN layer needs them: USERNAME is
+ * "<remote_ufrag>:<local_ufrag>", requests carry MESSAGE-INTEGRITY keyed with
+ * the remote pwd, responses with the local one. Empty strings before that. */
+const char *sig_local_ice_ufrag(const sig_conn_t *s);
+const char *sig_local_ice_pwd(const sig_conn_t *s);
+const char *sig_remote_ice_ufrag(const sig_conn_t *s);
+const char *sig_remote_ice_pwd(const sig_conn_t *s);
 
 /* Underlying socket, for an external poll() loop. -1 when not connected. */
 int sig_fd(const sig_conn_t *s);

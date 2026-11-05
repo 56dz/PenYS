@@ -108,9 +108,13 @@ void ys_session_shutdown(void);
 
 /* --- commands: all non-blocking, all safe from the JS thread --- */
 
-/* sdk_b64 is the base64 `sdk_param` from paasDispatch. Returns 0 if queued,
- * -1 on bad parameters, -2 if the queue is full, -3 if not initialised. */
-int ys_session_start(const char *sdk_b64, int x, int y, int w, int h);
+/* sdk_b64 is the base64 `sdk_param` from paasDispatch. `aid` is the gamer
+ * account id (may be NULL/empty): it is required by StartGameReq and is the one
+ * value the dispatch response does not carry, so the JS layer has to hand it
+ * over explicitly. Returns 0 if queued, -1 on bad parameters, -2 if the queue
+ * is full, -3 if not initialised. */
+int ys_session_start(const char *sdk_b64, const char *aid,
+                     int x, int y, int w, int h);
 int ys_session_stop(void);
 int ys_session_pause(void);
 int ys_session_resume(void);

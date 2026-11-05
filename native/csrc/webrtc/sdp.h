@@ -179,6 +179,15 @@ typedef struct {
     /* Session id / version for o=. 0 = derive from wall clock. */
     unsigned long session_id;
     unsigned long session_version;
+
+    /* Optional sinks for the ICE credentials we generated for this answer.
+     * The ICE layer needs both: our ufrag forms the STUN USERNAME
+     * ("remote_ufrag:local_ufrag"), our pwd verifies inbound responses.
+     * NULL/0 = the caller does not need them. */
+    char  *ice_ufrag_out;
+    size_t ice_ufrag_out_cap;
+    char  *ice_pwd_out;
+    size_t ice_pwd_out_cap;
 } sdp_answer_cfg_t;
 
 /* Fill `cfg` with the documented defaults. Call this before setting the

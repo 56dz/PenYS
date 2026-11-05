@@ -53,6 +53,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -73,6 +74,7 @@
 #include "webrtc/dtls.h"
 #include "webrtc/sdp.h"
 #include "webrtc/sig.h"
+#include "webrtc/stun.h"
 #include "webrtc/wss.h"
 
 /* ------------------------------------------------------------------ tuning */
@@ -89,6 +91,10 @@
 #define YS_WSS_TIMEOUT_MS       8000
 #define YS_DTLS_TIMEOUT_MS      6000
 #define YS_PREROLL_TIMEOUT_MS   3000
+/* The server's offer is a separate, slower stage than the WSS connect: the
+ * game pod can take a while to begin streaming after the dispatch completes,
+ * so give it a longer budget than the socket-level connect. */
+#define YS_OFFER_TIMEOUT_MS     60000
 
 /* Heartbeat: the browser SDK sends a bare empty text frame every 10 s. We send
  * the same. If nothing at all has arrived for 3 periods the session is
@@ -101,6 +107,15 @@
  * keep the UDP drain and heartbeat prompt, coarse enough that the device is not
  * spinning. It also bounds how long a stop request can sit unnoticed. */
 #define YS_TICK_MS              10
+
+/* Identity the signaling layer reports in StartGameReq. The service validates
+ * sdk_version loosely (it is used for feature gating, not auth), so echoing the
+ * web client's version is correct and keeps us on the same code paths as the
+ * official player. terminal_type is ClientTerminalType.WebTouch = 9 -- note
+ * that this is NOT the same enum as PROFILE.cloudClientType (18) in const.js,
+ * which belongs to the combo/passport API and means nothing here. */
+#define YS_CG_SDK_VERSION       "6.1.0.65"
+#define YS_CG_TERMINAL_WEB_TOUCH 9
 
 /* Signal frame types live in webrtc/sig.h (SIG_TYPE_SIGNALING/PROXY/
  * HANDSHAKE/KEEPALIVE). This file no longer packs or parses them: sig.c owns
@@ -121,6 +136,7 @@
  */
 typedef struct {
     char sid[128];
+    char pod_id[128];            /* StartGameReq field 7                 */
     char game_token[256];
     char game_svr_addr[64];      /* "ip:port"                        */
     int  rtc_udp_port;
@@ -212,6 +228,7 @@ static int sdk_decode(ys_sdk_param *out, const unsigned char *buf, size_t len) {
             if (l > len - i) return -1;
             switch (field) {
             case 1:  pb_str(out->sid, sizeof(out->sid), buf + i, (size_t)l); break;
+            case 3:  pb_str(out->pod_id, sizeof(out->pod_id), buf + i, (size_t)l); break;
             case 4:  pb_str(out->game_token, sizeof(out->game_token), buf + i, (size_t)l); break;
             case 8:  pb_str(out->game_svr_addr, sizeof(out->game_svr_addr), buf + i, (size_t)l);
                      out->has_addr = 1; break;
@@ -310,6 +327,7 @@ typedef struct {
     int state;
     int rect[4];
     char sdk_b64[YS_MAX_SDK_PARAM_B64 + 1];
+    char aid[64];                /* gamer account id, from the START command */
     ys_sdk_param sdk;
 
     /* signaling. Owned by webrtc/sig.c: this file only creates it, polls it,
@@ -496,6 +514,17 @@ static int w_bring_up_media(void) {
             p = atoi(colon + 1);
         }
         if (p <= 0 || p > 65535) { w_fail(YS_ERR_UDP, "game_svr_addr 端口非法"); return -1; }
+        /* game_svr_addr carries the reliable/TCP port (120.232.47.14:13600 in a
+         * real dispatch); the media plane lives on rtc_udp_port (13601). The
+         * web SDK rewrites every candidate to game_svr_ip:rtc_udp_port, so DTLS
+         * must go there -- knocking on the TCP port looks like a dead peer and
+         * burns the whole handshake budget in retransmissions. */
+        if (W.sdk.rtc_udp_port > 0 && W.sdk.rtc_udp_port <= 65535 &&
+            W.sdk.rtc_udp_port != p) {
+            ys_logf("udp: using rtc_udp_port=%d instead of game_svr_addr port %d",
+                    W.sdk.rtc_udp_port, p);
+            p = W.sdk.rtc_udp_port;
+        }
         if (inet_pton(AF_INET, ip, &ia) != 1) { w_fail(YS_ERR_UDP, "game_svr_addr 不是 IPv4"); return -1; }
 
         memset(&W.peer, 0, sizeof(W.peer));
@@ -525,6 +554,71 @@ static int w_bring_up_media(void) {
             if (fl >= 0) fcntl(W.udp_fd, F_SETFL, fl | O_NONBLOCK);
         }
         ys_logf("udp: connected to %s:%d (rtc_udp_port=%d)", ip, p, W.sdk.rtc_udp_port);
+
+        /* ---- ICE connectivity check.
+         *
+         * The media edge is ICE-lite behind a fixed port and will not answer
+         * DTLS from an address it has not validated: it learns our NAT'ed
+         * 5-tuple from this check. Without it the ClientHello is retransmitted
+         * until the budget runs out and nothing ever comes back.
+         *
+         * A failure here is not fatal on its own -- some edges answer DTLS
+         * anyway -- so we only log and let the handshake decide. */
+        {
+            const char *ru = sig_remote_ice_ufrag(W.sig);
+            const char *rp = sig_remote_ice_pwd(W.sig);
+            const char *lu = sig_local_ice_ufrag(W.sig);
+            if (ru && ru[0] && lu && lu[0]) {
+                unsigned char req[STUN_MAX_MSG];
+                unsigned char rbuf[STUN_MAX_MSG];
+                unsigned char txid[STUN_TXID_LEN];
+                unsigned char tie[8];
+                stun_result_t res;
+                uint32_t seed = ys_mono_ms() ^ (uint32_t)(size_t)&res;
+                int n, attempt, got = 0;
+
+                for (int i = 0; i < STUN_TXID_LEN; i++)
+                    txid[i] = (unsigned char)((seed = seed * 1103515245u + 12345u) >> 16);
+                for (int i = 0; i < 8; i++)
+                    tie[i] = (unsigned char)((seed = seed * 1103515245u + 12345u) >> 16);
+
+                n = stun_build_binding_request(ru, lu, rp, tie, txid, req, sizeof(req));
+                if (n <= 0) {
+                    ys_logf("ice: build failed (%d)", n);
+                } else {
+                    ys_logf("ice: binding request %d bytes (user=%s:%s pwd=%s)",
+                            n, ru, lu, (rp && rp[0]) ? rp : "-");
+                    for (attempt = 0; attempt < 4 && !got; attempt++) {
+                        struct pollfd pfd;
+                        if (send(W.udp_fd, req, (size_t)n, 0) < 0) {
+                            ys_logf("ice: send failed errno=%d", errno);
+                            break;
+                        }
+                        pfd.fd = W.udp_fd; pfd.events = POLLIN; pfd.revents = 0;
+                        if (poll(&pfd, 1, 400) > 0) {
+                            int rn = (int)recv(W.udp_fd, rbuf, sizeof(rbuf), 0);
+                            if (rn > 0 &&
+                                stun_parse_response(rbuf, (size_t)rn, txid, &res) == 0) {
+                                char desc[128];
+                                stun_result_str(&res, desc, sizeof(desc));
+                                ys_logf("ice: reply #%d %s", attempt, desc);
+                                if (res.msg_type == STUN_MSG_BINDING_RESPONSE)
+                                    got = 1;
+                            } else {
+                                ys_logf("ice: reply #%d not ours (%d bytes)", attempt, rn);
+                            }
+                        } else {
+                            ys_logf("ice: no reply #%d", attempt);
+                        }
+                    }
+                    if (!got)
+                        ys_logf("ice: no binding response; trying DTLS anyway");
+                }
+            } else {
+                ys_logf("ice: skipped (no credentials: remote=%d local=%d)",
+                        (ru && ru[0]) ? 1 : 0, (lu && lu[0]) ? 1 : 0);
+            }
+        }
     }
 
     /* ---- DTLS. ECDSA P-256: RSA-2048 costs 182-409 ms of certificate
@@ -632,6 +726,7 @@ static int w_send_answer(void) {
     }
     ys_logf("sig: answer sent (video pt=%d audio pt=%d)",
              sig_video_payload_type(W.sig), sig_audio_payload_type(W.sig));
+
     return 0;
 }
 
@@ -970,6 +1065,17 @@ static int w_run_session(void) {
         cfg.connect_timeout_ms = YS_WSS_TIMEOUT_MS;
         cfg.heartbeat_ms = YS_HEARTBEAT_MS;
         cfg.stale_ms = YS_STALE_MS;
+
+        /* The game-start exchange. See the long note in webrtc/sig.h: without
+         * StartGameReq the pod never boots the title and never sends an offer,
+         * which is exactly the NO_OFFER hang this project lived with. */
+        cfg.game_token = W.sdk.game_token[0] ? W.sdk.game_token : NULL;
+        cfg.account_id = W.aid[0] ? W.aid : NULL;
+        cfg.sid = W.sdk.sid[0] ? W.sdk.sid : NULL;
+        cfg.pod_id = W.sdk.pod_id[0] ? W.sdk.pod_id : NULL;
+        cfg.sdk_version = YS_CG_SDK_VERSION;
+        cfg.terminal_type = YS_CG_TERMINAL_WEB_TOUCH;
+
         cfg.cbs.on_offer = on_sig_offer;
         cfg.cbs.on_state = on_sig_state;
         cfg.user = &W;
@@ -988,7 +1094,7 @@ static int w_run_session(void) {
     }
 
 /* --- 2. wait for the server's offer (it is the offerer, not us) --- */
-    if (w_wait(YS_WSS_TIMEOUT_MS, done_offer, NULL, "offer") != 0) {
+    if (w_wait(YS_OFFER_TIMEOUT_MS, done_offer, NULL, "offer") != 0) {
         if (W.state != YS_ST_ERROR)
             w_fail(YS_ERR_NO_OFFER, "等待服务端 offer 超时");
         return -1;
@@ -1039,11 +1145,17 @@ static void w_handle_cmd(ys_cmd_t *c) {
     case YS_CMD_START: {
         ys_cmd_start *s = (ys_cmd_start *)c->payload;
         int sdk_len = s->sdk_len;
+        int aid_len = s->aid_len;
         if (sdk_len <= 0 || sdk_len > YS_MAX_SDK_PARAM_B64) {
             w_fail(YS_ERR_BAD_PARAM, "sdk_param 长度非法");
             return;
         }
-        if ((size_t)c->len < sizeof(ys_cmd_start) + (size_t)sdk_len) {
+        if (aid_len < 0 || aid_len >= (int)sizeof(W.aid)) {
+            w_fail(YS_ERR_BAD_PARAM, "aid 长度非法");
+            return;
+        }
+        if ((size_t)c->len < sizeof(ys_cmd_start) + (size_t)sdk_len + 1 +
+                              (size_t)aid_len + 1) {
             w_fail(YS_ERR_BAD_PARAM, "START 命令被截断");
             return;
         }
@@ -1059,6 +1171,12 @@ static void w_handle_cmd(ys_cmd_t *c) {
         W.rect[2] = s->rect_w; W.rect[3] = s->rect_h;
         memcpy(W.sdk_b64, s->sdk, (size_t)sdk_len);
         W.sdk_b64[sdk_len] = '\0';
+        if (aid_len > 0) {
+            memcpy(W.aid, s->sdk + sdk_len + 1, (size_t)aid_len);
+            W.aid[aid_len] = '\0';
+        } else {
+            W.aid[0] = '\0';
+        }
         if (w_run_session() != 0) {
             /* Every failure inside w_run_session has already called w_fail(),
              * but the resources allocated up to that point (signalling socket,
@@ -1221,26 +1339,36 @@ void ys_session_shutdown(void) {
     atomic_store(&G.inited, 0);
 }
 
-int ys_session_start(const char *sdk_b64, int x, int y, int w, int h) {
+int ys_session_start(const char *sdk_b64, const char *aid,
+                     int x, int y, int w, int h) {
     ys_cmd_start *s;
     unsigned char buf[YS_CMD_MAX_PAYLOAD];
-    int sdk_len, total;
+    char *dst;
+    int sdk_len, aid_len, total;
 
     if (!atomic_load(&G.inited)) return -3;
     if (!sdk_b64) return -1;
     sdk_len = (int)strlen(sdk_b64);
     if (sdk_len <= 0 || sdk_len > YS_MAX_SDK_PARAM_B64) return -1;
+    aid_len = aid ? (int)strlen(aid) : 0;
+    /* 96 chars is far beyond any real aid (they are short numeric strings) and
+     * keeps the command comfortably inside YS_CMD_MAX_PAYLOAD. */
+    if (aid_len < 0 || aid_len > 95) return -1;
     if (w <= 0 || h <= 0 || w > 4096 || h > 4096) return -1;
     if (x < 0 || y < 0 || x + w > 4096 || y + h > 4096) return -1;
 
-    total = (int)sizeof(ys_cmd_start) + sdk_len + 1;
+    total = (int)sizeof(ys_cmd_start) + sdk_len + 1 + aid_len + 1;
     if (total > (int)sizeof(buf)) return -1;
 
     memset(buf, 0, sizeof(buf));
     s = (ys_cmd_start *)buf;
     s->rect_x = x; s->rect_y = y; s->rect_w = w; s->rect_h = h;
     s->sdk_len = sdk_len;
-    memcpy(s->sdk, sdk_b64, (size_t)sdk_len + 1);
+    s->aid_len = aid_len;
+    dst = s->sdk;
+    memcpy(dst, sdk_b64, (size_t)sdk_len + 1);
+    dst += sdk_len + 1;
+    if (aid_len > 0) memcpy(dst, aid, (size_t)aid_len + 1);
     return ys_queue_push(&G.q, YS_CMD_START, buf, total) == 0 ? 0 : -2;
 }
 

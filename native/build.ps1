@@ -84,6 +84,7 @@ $srcNames = @(
   'webrtc/sig.c'
   'webrtc/dtls.c'
   'webrtc/sdp.c'
+  'webrtc/stun.c'
   'rtp/srtp.c'
   'rtp/rtp_reorder.c'
 

@@ -796,6 +796,10 @@ int sdp_build_answer(const sdp_offer_t *offer, const sdp_answer_cfg_t *cfg,
     sver = cfg->session_version ? cfg->session_version : sid;
 
     make_ice_cred(ufrag, sizeof(ufrag), pwd, sizeof(pwd), (unsigned int)sid);
+    if (cfg->ice_ufrag_out && cfg->ice_ufrag_out_cap)
+        copy_str(cfg->ice_ufrag_out, cfg->ice_ufrag_out_cap, ufrag, strlen(ufrag));
+    if (cfg->ice_pwd_out && cfg->ice_pwd_out_cap)
+        copy_str(cfg->ice_pwd_out, cfg->ice_pwd_out_cap, pwd, strlen(pwd));
 
     w.buf = out;
     w.cap = cap;

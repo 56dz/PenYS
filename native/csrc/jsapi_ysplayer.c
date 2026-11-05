@@ -146,10 +146,11 @@ static int valid_rect(int x, int y, int w, int h) {
 static JSValue js_start(JSContext *ctx, JSValueConst this_val, int argc,
                         JSValueConst *argv) {
     const char *sdk;
+    const char *aid = NULL;
     int x, y, w, h, rc;
     (void)this_val;
 
-    if (argc < 5) return mk_fail(ctx, "BAD_ARG", "start(sdkParam,x,y,w,h) 需要 5 个参数");
+    if (argc < 5) return mk_fail(ctx, "BAD_ARG", "start(sdkParam,x,y,w,h[,aid]) 需要 5 个参数");
     sdk = arg_str(ctx, argc, argv, 0);
     if (!sdk || !sdk[0]) {
         if (sdk) JS_FreeCString(ctx, sdk);
@@ -186,12 +187,18 @@ static JSValue js_start(JSContext *ctx, JSValueConst this_val, int argc,
         JS_FreeCString(ctx, sdk);
         return mk_fail(ctx, "BAD_RECT", "rect 非法（w/h 必须 > 0 且不越界）");
     }
+    /* Optional 6th argument: the gamer account id. StartGameReq needs it and
+     * sdk_param does not carry it, so a caller that forgets it gets a clear
+     * failure from the server instead of a mystery timeout. */
+    if (argc > 5) aid = arg_str(ctx, argc, argv, 5);
     if (ensure_init() != 0) {
+        if (aid) JS_FreeCString(ctx, aid);
         JS_FreeCString(ctx, sdk);
         return mk_fail(ctx, "NO_WORKER", "worker 线程创建失败");
     }
 
-    rc = ys_session_start(sdk, x, y, w, h);
+    rc = ys_session_start(sdk, aid, x, y, w, h);
+    if (aid) JS_FreeCString(ctx, aid);
     JS_FreeCString(ctx, sdk);
     if (rc == 0) return mk_ok(ctx);
     if (rc == -2) return mk_fail(ctx, "QUEUE_FULL", "命令队列满，请稍后重试");
@@ -362,7 +369,7 @@ static JSValue js_info(JSContext *ctx, JSValueConst this_val, int argc,
  * exports are registered, matching PenDouyu's proven pattern.
  */
 #define YS_EXPORTS(X)              \
-    X("start",    js_start,    5)  \
+    X("start",    js_start,    6)  \
     X("stop",     js_stop,     0)  \
     X("pause",    js_pause,    0)  \
     X("resume",   js_resume,   0)  \

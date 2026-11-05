@@ -181,10 +181,15 @@ function sleep(ms) {
  * sdkParam 是 paasDispatch 返回的 base64 protobuf，native 自己解；
  * JS 不解析它，也就不需要把字段一个个搬进来（少一层出错面）。
  *
+ * aid 是登录拿到的 gamer 账号 id。它**不在** sdk_param 里，而服务端的
+ * StartGameReq 需要它才能知道该给谁开哪台机器——缺了它服务端只会回一个
+ * server hello 然后彻底沉默，表现就是「服务器 offer 连接超时」。所以这里
+ * 必须显式传下去，别指望从 sdk_param 里能解出来。
+ *
  * 返回 { ok:true } 表示**画面已经上屏**（native 等到 KMS 平面 ACTIVE 才返回），
  * 不是「请求已发出」。这一点很重要：UI 拿到 ok 就可以直接撤掉骨架屏。
  */
-export async function start({ sdkParam, rect } = {}) {
+export async function start({ sdkParam, rect, aid } = {}) {
   const m = await ensureNative();
   if (!m) return { ok: false, code: 'NO_MODULE', error: loadError };
 
@@ -193,10 +198,11 @@ export async function start({ sdkParam, rect } = {}) {
   if (typeof sdkParam !== 'string' || sdkParam.length < 32) {
     return { ok: false, code: 'BAD_SDK_PARAM', error: 'sdkParam 为空或过短' };
   }
+  const aidStr = (aid === undefined || aid === null) ? '' : String(aid).trim();
 
   let res;
   try {
-    res = m.start(sdkParam, r.x, r.y, r.w, r.h);
+    res = m.start(sdkParam, r.x, r.y, r.w, r.h, aidStr);
   } catch (e) {
     return { ok: false, code: 'THROW', error: (e && e.message) || String(e) };
   }
