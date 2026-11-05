@@ -201,6 +201,20 @@ export async function loginPollStatus(ticket) {
     cookieJarKey: state.jarKey
   });
 
+  /* 每个 ticket 只打一次形状日志（真机验收要看到未扫码时的
+   * data.status / tokens，以及 -3503 QRLoginDeviceInconsistent 是否复发）。
+   * 每轮都打会把 DictPen_*.log 刷爆，所以按 ticket 去重。 */
+  if (state.pollLoggedTicket !== ticket) {
+    state.pollLoggedTicket = ticket;
+    var shape = res.data || {};
+    var tok = shape.tokens;
+    safeWarn('[ys] queryQRLoginStatus 形状: code=' + res.code +
+      ' status=' + String(shape.status === undefined ? '(无)' : shape.status) +
+      ' tokens=' + (Array.isArray(tok) ? ('Array(' + tok.length + ')')
+        : (tok === undefined ? 'undefined' : typeof tok)) +
+      ' dataKeys=' + (res.data ? Object.keys(res.data).join(',') : '(无 data)'));
+  }
+
   if (res.code === C.RETCODE.QR_EXPIRED) {
     return { status: 'Expired', code: res.code, message: res.message };
   }

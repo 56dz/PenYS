@@ -32,6 +32,16 @@
  *   - sig_video_payload_type() / sig_audio_payload_type() report what the
  *     answer settled on.
  *
+ * SESSION.C AUDIT POINTS (the six review items, made executable)
+ *   - cfg.connect_timeout_ms bounds sig_open's blocking connect;
+ *   - the last-rx age API's pre-open trap (raw uptime) and its reset at open;
+ *   - stale_ms actually walks the machine to SIG_STATE_STALE;
+ *   - the answer embeds the exact DTLS fingerprint (cert existed first);
+ *   - candidate_port = 0 passes server candidates through untouched;
+ *   - sig_close -> sig_destroy is safe, repeated, and sig_poll answers -1
+ *     immediately afterwards (the session.c wait loop can neither hang nor
+ *     spin on it).
+ *
  * WHAT IS NOT VERIFIED
  *   The real service. A real game_server_wss_url only exists inside sdk_param,
  *   which is only obtainable through paasDispatch -- and that bills the user's
@@ -616,8 +626,12 @@ static void run_child(int port_fd, int result_fd)
         cand_tx = 2;
     }
 
-    /* ---- 5. watch what the client sends back for a while ---- */
-    deadline = now_ms() + 2000;
+    /* ---- 5. watch what the client sends back for a while ----
+     * 3.5 s rather than 2 s: the parent's stale-wait (stale_ms = 1500 after
+     * the candidates) must finish while this socket is still alive, or the
+     * parent would see a closed socket instead of SIG_STATE_STALE. The parent
+     * closes first in normal operation, which breaks this loop early. */
+    deadline = now_ms() + 3500;
     while (now_ms() < deadline) {
         int op;
         unsigned char *pl;
@@ -774,8 +788,9 @@ static int run_parent(int port_fd, int result_fd)
     cfg.codecs = 0;               /* accept what is offered */
     cfg.sendrecv = 0;
     cfg.accept_datachannel = 0;
+    cfg.connect_timeout_ms = 8000; /* session.c passes YS_WSS_TIMEOUT_MS here */
     cfg.heartbeat_ms = 300;       /* short, so heartbeats are observable */
-    cfg.stale_ms = 30000;
+    cfg.stale_ms = 1500;          /* short, so SIG_STATE_STALE is observable */
     cfg.cbs.on_offer = on_offer;
     cfg.cbs.on_candidate = on_candidate;
     cfg.cbs.on_state = on_state;
@@ -789,12 +804,38 @@ static int run_parent(int port_fd, int result_fd)
     }
     note_state(&cc, SIG_STATE_IDLE);
 
+    /* --- audit point (6): what does the age API say before sig_open()? ---
+     * sig.c only stamps t_last_rx_ms inside sig_open(), so a created-but-not-
+     * opened handle reports now - 0 = raw CLOCK_MONOTONIC uptime. If
+     * session.c ever ran its stale check before PLAYING this would read as an
+     * instant stale (age > YS_STALE_MS = 30000). session.c gates the check on
+     * (state == YS_ST_PLAYING && W.sig) and PLAYING is unreachable without a
+     * successful sig_open, so the trap exists here and must stay unreachable
+     * there. */
+    {
+        long long u0 = now_ms();
+        int pre = sig_last_rx_age_ms(s);
+        long long u1 = now_ms();
+        printf("  pre-open last-rx age = %d ms (raw monotonic clock)\n", pre);
+        ck(sig_last_rx_age_ms(NULL) == -1,
+           "sig_last_rx_age_ms(NULL) == -1");
+        ck((long long)pre >= u0 && (long long)pre <= u1,
+           "pre-open age is raw uptime: session must not read it before PLAYING");
+    }
+
     {
         long long t0 = now_ms();
         int rc = sig_open(s);
-        printf("  sig_open rc=%d in %lld ms, state=%s\n", rc,
-               now_ms() - t0, sig_state_str(s));
+        long long dt = now_ms() - t0;
+        printf("  sig_open rc=%d in %lld ms, state=%s\n", rc, dt,
+               sig_state_str(s));
         ck(rc == 0, "sig_open connected and sent client hello");
+        /* audit point (2): the worker-thread block must fit the budget. */
+        ck(dt >= 0 && dt < 8000,
+           "sig_open blocked < 8000 ms (YS_WSS_TIMEOUT_MS budget)");
+        /* audit point (6): open stamps t_last_rx_ms = t_open_ms. */
+        ck(sig_last_rx_age_ms(s) >= 0 && sig_last_rx_age_ms(s) < 1000,
+           "sig_open resets last-rx age (stale timer starts at open)");
     }
     if (sig_state(s) < SIG_STATE_OPEN) {
         printf("  FAIL open failed: %s\n", sig_last_error(s));
@@ -843,6 +884,43 @@ static int run_parent(int port_fd, int result_fd)
         (void)connected_ms;
     }
 
+    /* --- audit point (1)/(6): stale_ms semantics ---
+     * The mock goes silent after its two candidates; with stale_ms = 1500 the
+     * machine must walk itself to SIG_STATE_STALE with no help, and the age
+     * API must then agree the silence is past the deadline. session.c uses
+     * the same mechanism with YS_STALE_MS = 30000 (session.c:955), gated on
+     * PLAYING (session.c:1129-1131). */
+    {
+        long long dl = now_ms() + 4 * 1500;
+        while (sig_state(s) != SIG_STATE_STALE && now_ms() < dl) {
+            if (sig_poll(s, 50) < 0)
+                break;
+        }
+        printf("  state after silence: %s, last rx age = %d ms\n",
+               sig_state_str(s), sig_last_rx_age_ms(s));
+        ck(sig_state(s) == SIG_STATE_STALE,
+           "stale fires after stale_ms of server silence");
+        ck(sig_last_rx_age_ms(s) > 1500,
+           "age exceeds stale_ms once the state is STALE");
+    }
+
+    /* --- audit point (4): the DTLS cert must predate the answer ---
+     * session.c creates W.dtls (session.c:903) before sig_create
+     * (session.c:960) and only then lets sig_answer_auto (session.c:629)
+     * run; here `d` likewise predates sig_create, and we prove it by
+     * rebuilding the answer and finding the exact same fingerprint inside
+     * it -- with the "sha-256 " prefix sig.h requires. */
+    {
+        char abuf[8192];
+        int an = sig_build_answer(s, abuf, sizeof(abuf));
+        printf("  sig_build_answer -> %d bytes\n", an);
+        ck(an > 0, "sig_build_answer rebuilt the answer after the exchange");
+        ck(strstr(abuf, "a=fingerprint:sha-256 ") != NULL,
+           "answer carries a=fingerprint:sha-256 (sig.h contract)");
+        ck(fp != NULL && strstr(abuf, fp) != NULL,
+           "answer embeds the exact DTLS fingerprint (cert existed first)");
+    }
+
     printf("\n  --- what the machine reported ---\n");
     ck(cc.offer_seen, "on_offer fired");
     ck(cc.answers_sent == 1, "sig_answer_auto() sent exactly one answer");
@@ -883,8 +961,25 @@ static int run_parent(int port_fd, int result_fd)
         ck(t >= 0 && t <= 1000, "sig_next_timeout is a usable poll timeout");
     }
 
-    sig_close(s);
+    /* --- audit points (3) + (5): teardown contract ---
+     * session.c's w_wait does `if (sig_poll(W.sig, ...) < 0) return -1;`
+     * (session.c:422) -- it must get an immediate -1 after close, never a
+     * 5000 ms nap and never a silent success that keeps the wait loop alive.
+     * And sig_close must be safe to repeat before sig_destroy frees the
+     * handle: w_teardown is idempotent and runs on three paths (stop, error
+     * unwind, worker exit; session.c:841-846). */
+    ck(sig_close(s) == 0, "sig_close on the live connection");
+    {
+        long long t0 = now_ms();
+        int rc = sig_poll(s, 5000);
+        long long dt = now_ms() - t0;
+        printf("  sig_poll after close -> %d in %lld ms\n", rc, dt);
+        ck(rc == -1 && dt < 500,
+           "sig_poll returns -1 immediately after close (no wait-loop hang)");
+    }
+    ck(sig_close(s) == 0, "sig_close twice is safe (teardown is idempotent)");
     sig_destroy(s);
+    ck(1, "sig_destroy after close did not crash");
     dtls_client_destroy(d);
 
     /* Collect the child's verdict. A single read() is not enough: the answer
@@ -948,6 +1043,173 @@ static int run_parent(int port_fd, int result_fd)
     return 0;
 }
 
+/* ============ second session: candidate_port = 0 (audit point 1) ==========
+ *
+ * sig.h: "Set candidate_port to 0 to disable rewriting (candidates pass
+ * through)." session.c relies on exactly that when game_svr_addr carries no
+ * port (session.c:940-942 clears cand_ip => candidate_ip NULL, cand_port
+ * stays 0 at session.c:917/948), and sig.c:715 only rewrites when
+ * candidate_ip && candidate_port > 0. Same mock service, same fixture
+ * candidates -- only the config differs, so any difference in what
+ * on_candidate delivers is the gate's doing. */
+static int run_parent_port0(int port_fd, int result_fd)
+{
+    client_ctx_t cc;
+    sig_cfg_t cfg;
+    sig_conn_t *s;
+    dtls_client_t *d;
+    char url[128], verdict[4096];
+    int port = 0;
+    long long deadline;
+
+    memset(&cc, 0, sizeof(cc));
+    verdict[0] = 0;
+
+    if (read(port_fd, &port, sizeof(port)) != (ssize_t)sizeof(port)) {
+        printf("  FAIL could not read child2's port\n");
+        return 1;
+    }
+    printf("\n  ===== second session: candidate_port=0 =====\n");
+    printf("  child2 service listening on 127.0.0.1:%d\n", port);
+
+    d = dtls_client_create(DTLS_KEY_ECDSA_P256);
+    if (!d) {
+        printf("  FAIL dtls_client_create (child2)\n");
+        return 1;
+    }
+
+    snprintf(url, sizeof(url), "wss://127.0.0.1:%d/rtc-sdk", port);
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.url = url;
+    cfg.fingerprint = dtls_local_fingerprint(d);
+    cfg.candidate_ip = NULL;      /* the gate under test */
+    cfg.candidate_port = 0;       /* sig.h: 0 disables rewriting */
+    cfg.local_ip = "127.0.0.1";
+    cfg.connect_timeout_ms = 8000;
+    cfg.heartbeat_ms = 300;
+    cfg.stale_ms = 30000;         /* keep stale out of this session */
+    cfg.cbs.on_offer = on_offer;
+    cfg.cbs.on_candidate = on_candidate;
+    cfg.cbs.on_state = on_state;
+    cfg.user = &cc;
+
+    s = sig_create(&cfg);
+    if (!s) {
+        printf("  FAIL sig_create (child2)\n");
+        dtls_client_destroy(d);
+        return 1;
+    }
+    note_state(&cc, SIG_STATE_IDLE);
+
+    {
+        long long t0 = now_ms();
+        int rc = sig_open(s);
+        printf("  sig_open rc=%d in %lld ms\n", rc, now_ms() - t0);
+        ck(rc == 0, "port0: sig_open connected");
+    }
+    if (sig_state(s) < SIG_STATE_OPEN) {
+        printf("  FAIL open failed: %s\n", sig_last_error(s));
+        sig_destroy(s);
+        dtls_client_destroy(d);
+        return 1;
+    }
+
+    /* Offer -> answer -> candidates -> trickle, the same shape as session.c's
+     * w_run_session, bounded so a broken gate fails instead of hanging. */
+    deadline = now_ms() + 6000;
+    while (now_ms() < deadline && !cc.entered_connected) {
+        if (sig_poll(s, 20) < 0 && sig_state(s) >= SIG_STATE_CLOSED)
+            break;
+        if (cc.offer_seen && cc.answers_sent == 0) {
+            if (sig_answer_auto(s) == 0)
+                cc.answers_sent = 1;
+        }
+        if (cc.entered_connected && !cc.cand_sent) {
+            if (sig_send_candidate(s,
+                    "candidate:1 1 udp 2130706431 10.1.2.3 51234 typ host") == 0)
+                cc.cand_sent = 1;
+        }
+    }
+
+    printf("  port0: offer=%d answers=%d candidates=%d\n",
+           cc.offer_seen, cc.answers_sent, cc.cand_seen);
+    printf("  first candidate as delivered:\n    %s\n", cc.cand_first);
+    ck(cc.offer_seen, "port0: offer arrived");
+    ck(cc.answers_sent == 1, "port0: answer sent");
+    ck(cc.cand_seen == 2, "port0: both server candidates arrived");
+    ck(strstr(cc.cand_first, "157.255.56.121 50122") != NULL,
+       "candidate_port=0: original ip:port preserved (rewrite disabled)");
+    ck(strstr(cc.cand_first, "157.255.56.100") == NULL,
+       "candidate_port=0: the rewrite target is absent");
+    ck(strstr(cc.cand_first, "network-cost 999") != NULL,
+       "candidate_port=0: trailing attributes still intact");
+    ck(strstr(cc.cand_line, "10.0.0.5 5000") != NULL,
+       "candidate_port=0: second candidate also untouched");
+
+    sig_close(s);
+    sig_destroy(s);
+    dtls_client_destroy(d);
+
+    (void)waitpid(-1, NULL, 0);
+    {
+        size_t got = 0;
+        while (got < sizeof(verdict) - 1) {
+            ssize_t r = read(result_fd, verdict + got,
+                             sizeof(verdict) - 1 - got);
+            if (r <= 0)
+                break;
+            got += (size_t)r;
+        }
+        verdict[got] = 0;
+    }
+    ck(strstr(verdict, "VERDICT PASS") != NULL,
+       "port0: the service accepted the whole exchange");
+    return 0;
+}
+
+/* ====== third probe: connect_timeout_ms is a real budget (audit point 2) ==
+ *
+ * An unreachable endpoint with a 1500 ms budget must fail fast and bounded.
+ * session.c passes YS_WSS_TIMEOUT_MS (8000, session.c:953) and the worker
+ * thread sits inside sig_open for the whole attempt (session.c:965 runs on
+ * the worker; stop requests are only observed after w_run_session returns),
+ * so an ignored budget would wedge the worker. The bound asserted here is
+ * 8000 ms: three wss phases of 1500 ms each stay comfortably inside it. */
+static void run_parent_budget(void)
+{
+    sig_cfg_t cfg;
+    sig_conn_t *s;
+    long long t0, dt;
+    int rc;
+
+    printf("\n  ===== connect budget probe (unreachable endpoint) =====\n");
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.url = "wss://10.255.255.1:9/rtc-sdk";
+    cfg.connect_timeout_ms = 1500;
+
+    s = sig_create(&cfg);
+    ck(s != NULL, "budget: sig_create for the unreachable probe");
+    if (!s)
+        return;
+    ck(sig_next_timeout(s) == -1, "budget: next_timeout == -1 before open");
+    ck(sig_last_rx_age_ms(s) != -1, "budget: age is not -1 on a live handle");
+
+    t0 = now_ms();
+    rc = sig_open(s);
+    dt = now_ms() - t0;
+    printf("  sig_open(unreachable) rc=%d in %lld ms (budget 1500 ms)\n",
+           rc, dt);
+    ck(rc == -1, "budget: sig_open fails against an unreachable endpoint");
+    ck(dt >= 0 && dt < 8000,
+       "budget: bounded well under YS_WSS_TIMEOUT_MS (8000 ms)");
+    ck(sig_state(s) == SIG_STATE_FAILED,
+       "budget: state FAILED after a failed open");
+    ck(sig_poll(s, 0) == -1, "budget: sig_poll after failed open is -1");
+    ck(sig_close(s) == 0, "budget: sig_close after failed open is safe");
+    sig_destroy(s);
+    ck(1, "budget: destroy after failed open did not crash");
+}
+
 int main(void)
 {
     int port_pipe[2], result_pipe[2];
@@ -977,6 +1239,31 @@ int main(void)
     run_parent(port_pipe[0], result_pipe[0]);
     close(port_pipe[0]);
     close(result_pipe[0]);
+
+    /* Second session: same mock service, candidate_port=0 (audit point 1). */
+    if (pipe(port_pipe) != 0 || pipe(result_pipe) != 0) {
+        perror("pipe2");
+        return 1;
+    }
+    pid = fork();
+    if (pid < 0) {
+        perror("fork2");
+        return 1;
+    }
+    if (pid == 0) {
+        close(port_pipe[0]);
+        close(result_pipe[0]);
+        run_child(port_pipe[1], result_pipe[1]);
+        _exit(0);
+    }
+    close(port_pipe[1]);
+    close(result_pipe[1]);
+    run_parent_port0(port_pipe[0], result_pipe[0]);
+    close(port_pipe[0]);
+    close(result_pipe[0]);
+
+    /* Third probe: the connect budget against an unreachable endpoint. */
+    run_parent_budget();
 
     printf("\n===== %s (%d checks, %d failures) =====\n",
            failures ? "FAILED" : "ALL PASS", checks, failures);

@@ -131,6 +131,9 @@ async function listPingServer() {
  * 测速失败（rtt=-1）不是错误：该节点按 rtt=0 上报，让服务端自己挑。
  */
 async function measureRtt(pingServers, perServerTimeoutMs) {
+  // ysws 也要预热：falcon 没有全局 require，只能 import('ysws') 异步拿。
+  // 这里 await 一次，下面 rttOnce() 的同步 nativeModule() 就能直接命中缓存。
+  try { await http.ensureModule('ysws'); } catch (e) { /* 下面逐个 reject 兜底 */ }
   var results = [];
   for (var i = 0; i < pingServers.length; i++) {
     var s = pingServers[i] || {};
@@ -164,10 +167,25 @@ function rttOnce(url, timeoutMs) {
   return new Promise(function (resolve, reject) {
     var w = null;
     try {
-      w = require('ysws');
+      // falcon 运行时没有全局 require（实测 'require' is not defined），
+      // 改走 http.js 的通用加载器：import('ysws') 预热 + 同步读缓存。
+      w = http.nativeModule('ysws');
     } catch (e) {
       return reject(new Error('ysws 不可用: ' + ((e && e.message) || e)));
     }
+    if (!w) {
+      // 还没热完（measureRtt 通常已经 await 过 ensureModule，这里只是兜底）
+      return void http.ensureModule('ysws').then(function (m) {
+        if (!m) return reject(new Error('ysws 不可用: ' + (http.moduleError('ysws') || 'import 失败')));
+        w = m;
+        runRtt();
+      }, function (e) {
+        reject(new Error('ysws 不可用: ' + ((e && e.message) || e)));
+      });
+    }
+    return runRtt();
+
+    function runRtt() {
     var m = (w && w.default) ? w.default : w;
     if (!m || typeof m.rttStart !== 'function') return reject(new Error('ysws 缺少 rttStart'));
 
@@ -198,7 +216,8 @@ function rttOnce(url, timeoutMs) {
       if (!r.ok || !r.recvd) return reject(new Error(r.error || 'rtt failed'));
       resolve(Math.round(r.avgRtt));
     }
-    poll();
+      poll();
+    }
   });
 }
 

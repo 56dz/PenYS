@@ -11,6 +11,12 @@
  * 所以 jar 走 native 的固定路径（应用数据目录下 ys_cookies.txt）。
  */
 
+/* 复用 http.js 的通用 native 模块加载器（import('yshttp') 字面量预热 +
+ * typeof require 守卫 + globalThis.__yshttp 测试注入）。
+ * 不能在这里自己写 require('yshttp')：falcon 运行时没有全局 require
+ * （2026-11-05 实测 'require' is not defined），jar 会永远读不到。 */
+import { nativeModule } from './http.js';
+
 const STORE_KEY = 'ys_session_v1';
 
 /* Falcon storage 的坑（PenBili/src/services/storage.js 实测）：
@@ -137,17 +143,16 @@ export function clearJar() {
   try { m.jarClear(JAR_KEY); return true; } catch (e) { return false; }
 }
 
-/* native 模块加载：与 http.js 同一套双路径
- *   生产：Falcon 注入 require()  -> require('yshttp')
- *   设备侧测试宿主（jsrunner2）：没有 require，模块命名空间挂在 globalThis.__yshttp
+/* native 模块加载：统一走 http.js 的三路径加载器。
+ *   1. 测试宿主 globalThis.__yshttp
+ *   2. require —— 仅当 typeof require === 'function'（Node 测试用）
+ *   3. import('yshttp') 字面量 —— falcon 生产路径（唯一能用的）
+ * 同步拿不到就返回 null 并在后台点火；调用方若在 async 上下文里，
+ * 先 await http.ensureNative() 再调这些 jar 函数。
  */
 function loadHttp() {
   try {
-    var g = typeof globalThis !== 'undefined' ? globalThis : null;
-    var raw = (g && g.__yshttp) ? g.__yshttp
-            : (typeof require === 'function' ? require('yshttp') : null);
-    var mod = (raw && raw.default) ? raw.default : raw;
-    return mod || null;
+    return nativeModule('yshttp') || null;
   } catch (e) {
     return null;
   }

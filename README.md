@@ -20,6 +20,7 @@
 | 六步调度（login→SpeedLimit→statusCheck→listPingServer→RTT→getNodesInfo） | ✅ | 未登录即可跑通，`fetchGears` 返回 5 档 `top=9000/4800/3200/1800/1200` |
 | DTLS 1.2 + SRTP 密钥导出 | ✅ | 真机握手成功，协商 `SRTP_AES128_CM_SHA1_80`，E2E 22/22 |
 | SRTP 加解密（RFC 3711 AES-CM + HMAC-SHA1-80） | ✅ | 真机 75/75；`protect` 7.80 µs/pkt，60fps 占单核 0.093%；零堆分配 |
+| SRTP 长时稳定（**100 万包**连续跑） | ✅ | `RESULT: PASS (0 failures)` 16.7s：seq16/ROC 回绕 16/16 正确、`false_late=0`、循环期 **0 次 malloc**、VmRSS +0kB、前 1 万 vs 后 1 万 `14.446 → 14.335 µs/pkt`（不升反微降） |
 | WSS 建连 + RTT 测速 | ✅ | 真机 101 升级，256 ms 建连 / 39 ms RTT |
 | 硬解上屏 `mppvideodec ! kmssink` | ✅ | 真实 RTP 流上屏（`rtpprobe`），坐标系换算已裁定 |
 | Falcon 打包 + 原生模块加载 | ✅ | `.amr` 装机 → `/tmp/penys.log` 出现 `ysplayer 1.0.0 module init` |
@@ -145,7 +146,10 @@ adb shell cat /tmp/penys.log
    当前只支持扫码登录。
 4. **视频平面覆盖 UI**：云游戏画面走 KMS 独立平面（zpos 2），playing 态的控制条只能做浮层，
    不能靠普通 DOM 层级压过去。
-5. **未发送 RTCP Receiver Report**：服务端拥塞控制是否会因此误判降码率，待验证。
+5. **不发送 RTCP Receiver Report**（有意为之）：保活/掉线判定走 WSS 裸空帧 + GameControlChannel
+   ping-pong，SDP 里没有协商任何 `rtcp-fb`（NACK/PLI/TWCC/REMB 均未回显），码率在 `paasDispatch`
+   请求体里一次性定死（`bit_rate = 1024 × gear.top`）——发一个算不准的 RR 反而可能触发服务端误判。
+   重评触发条件：真实会话观测到服务端按接收反馈调码率，或出现相关文档/抓包证据。
 
 ---
 

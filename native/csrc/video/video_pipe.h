@@ -60,8 +60,9 @@ void        ys_video_destroy(ys_video_t *v);
  * 最长阻塞 preroll_timeout_ms（建议 3000）。 */
 int ys_video_start(ys_video_t *v, int preroll_timeout_ms);
 
-/* 逻辑画布坐标 (x,y,w,h)，内部换算成面板坐标：
- *   panel_x = y, panel_y = PANEL_H - (x + w) - PANEL_X_DEADZONE, panel_w = h, panel_h = w
+/* 逻辑画布坐标 (x,y,w,h)，内部换算成面板坐标（107px 死区加在 x 轴，
+ * PANEL_X_DEADZONE 不参与 panel_y；全画布 (0,0,960,266) 实测 dst = [107,0,266x960]）：
+ *   panel_x = YS_PANEL_X_DEADZONE + y, panel_y = PANEL_H - (x + w), panel_w = h, panel_h = w
  * 传非法值（w<=0 / h<=0 / 非有限）返回 -1 且不改当前 rect。
  * 只允许缩小，放大返回 -1（render-rectangle 单向棘轮）。 */
 int ys_video_set_rect(ys_video_t *v, int x, int y, int w, int h);

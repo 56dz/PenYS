@@ -215,44 +215,36 @@
     </template>
 
     <!-- ==================== playing：游戏中 ====================
-         KMS 视频平面会盖在整块 960x266 上（native 侧渲染），
-         所以根节点用 .page-play（完全透明），UI 只画"不透明的那几块"。
-         控制条占底部 40px、一键隐藏后换成 16px 唤起条 ——
-         用 flex 列排布而不是绝对定位，所以控制条永远不会压到画面中央。 -->
+         KMS 视频平面（Esmart1 zpos 2）会盖住 VIDEO_BOX 内适配后视频矩形里的 UI，
+         所以浮层必须落在视频矩形之外：顶 24px 状态条（左上 fps·延迟 /
+         右上 码率·音频·丢包 / 中间提示），中 202px 是视频+触摸区，
+         底 40px 是返回/暂停操作条。根节点 .page-play 完全透明，
+         视频区内不放任何不透明背景。flex 列排布，不用绝对定位。 -->
     <template v-if="mode === 'playing'">
-      <div :class="railVisible ? 'pl-video' : 'pl-video-mid'">
-        <div :class="railVisible ? 'pl-touch' : 'pl-touch-mid'" @touchstart="onTouchStart" @touchmove="onTouchMove" @touchend="onTouchEnd">
-          <div v-if="!videoReady" class="pl-ph-fill">
-            <text class="pl-ph-title">云·原神</text>
-            <div class="pl-ph-gap"></div>
-            <text class="pl-ph-sub">{{ phSub }}</text>
-          </div>
+      <div class="pl-top">
+        <div class="pl-chipgrp">
+          <div class="pl-chip"><text class="pl-chiptxt">{{ plTop }}</text></div>
+          <div class="pl-chip"><text class="pl-chiptxt">{{ plLat }}</text></div>
+        </div>
+        <div class="pl-hint" :class="plErr ? 'pl-hint-warn' : 'pl-hint-idle'">
+          <text :class="plErr ? 'pl-chiptxt pl-chiptxt-warn' : 'pl-chiptxt pl-chiptxt-dim'">{{ plErr }}</text>
+        </div>
+        <div class="pl-chipgrp">
+          <div class="pl-chip"><text class="pl-chiptxt">{{ plBr }}</text></div>
+          <div class="pl-chip"><text class="pl-chiptxt">{{ plAudio }}</text></div>
+          <div class="pl-chip"><text class="pl-chiptxt">{{ plLost }}</text></div>
         </div>
       </div>
-      <div v-if="railVisible" class="pl-rail">
+      <div class="pl-stage" @touchstart="onTouchStart" @touchmove="onTouchMove" @touchend="onTouchEnd" @touchcancel="onTouchCancel"></div>
+      <div class="pl-bar">
         <div class="pl-btn" @click="leaveGame('返回')">
           <text class="pl-btn-txt">返回</text>
         </div>
         <div class="pl-btn" @click="togglePause">
           <text :class="paused ? 'pl-btn-txt pl-btn-txt-on' : 'pl-btn-txt'">{{ paused ? '继续' : '暂停' }}</text>
         </div>
-        <div class="pl-btn" @click="cycleGear">
-          <text class="pl-btn-txt">{{ gearBtnText }}</text>
-        </div>
-        <div class="pl-btn" @click="toggleMute">
-          <text :class="muted ? 'pl-btn-txt pl-btn-txt-on' : 'pl-btn-txt'">{{ muted ? '已静音' : '音量' }}</text>
-        </div>
-        <div class="pl-btn pl-btn-danger" @click="leaveGame('断开')">
-          <text class="pl-btn-txt pl-btn-txt-danger">断开</text>
-        </div>
         <div class="pl-spring"></div>
         <text :class="statOk ? 'pl-stat pl-stat-ok' : 'pl-stat'">{{ statText }}</text>
-        <div class="pl-btn" @click="railVisible = false">
-          <text class="pl-btn-txt">隐藏</text>
-        </div>
-      </div>
-      <div v-else class="pl-handle" @click="railVisible = true">
-        <text class="pl-handle-txt">▲ 点击显示控制条</text>
       </div>
     </template>
 
@@ -309,11 +301,57 @@ function logWarn(msg) {
   }
 }
 
-/* 视频区矩形（逻辑坐标 960x266）。取满画布：
- * KMS 平面铺满整块合成面，视觉上才是"游戏占满屏幕"。
- * 底部 40px 会被控制条压住，但控制条可一键隐藏 —— 这是宽高比 3.6:1 的
- * 口袋里最合理的取舍（若把视频缩到 226 高，隐藏控制条后底部会留一条黑边）。 */
-const VIDEO_RECT = { x: 0, y: 0, w: 960, h: 266 };
+/* 视频**布局 box**（逻辑坐标 960x266），方案 B 留边：
+ * 顶部 24px 给左上/右上状态浮层、底部 40px 给返回/暂停操作条，中间 202px 才是视频。
+ * KMS 平面（Esmart1 zpos 2）会盖住 rect 内的一切 UI —— 满画布 rect 会让
+ * 浮层/操作条在物理屏上全被 video 压死（base.less 注释与 x6pro-video-playback.md
+ * 的结论一致：控制条必须落在视频矩形之外）。因此这里给上下留边。
+ * 注意 native render-rectangle 是单向棘轮（只许缩小），所以 rect 只能改小。 */
+const VIDEO_BOX = { x: 0, y: 24, w: 960, h: 202 };
+/* 服务端流源尺寸兜底（ys/const.js PROFILE.resolution，dispatch 的 resolution
+ * 就是它；实测 ontrack 2118x978 同为 2.165:1）。 */
+const PROFILE_SRC = { w: 2532, h: 1170 };
+
+/* 源 → box 内的适配矩形（居中、保宽高比、偶数对齐）。
+ * 直接把 2532x1170 塞进 960x202 会横向拉伸 1.76x（人脸变胖、UI 变形），
+ * 必须先按源宽高比 fit（PenDouyu playVideoRects 的套路）。
+ * 例：fit(2532,1170,box) → h=202, w=round(202*2532/1170)=437 → 偶数 438,
+ * x=(960-438)/2=261。两侧各留 ~261px 空白（物理可见，浮层可利用）。 */
+function fitEvenRect(srcW, srcH, box) {
+  const sw = num(srcW);
+  const sh = num(srcH);
+  if (sw <= 0 || sh <= 0) return { x: box.x, y: box.y, w: box.w, h: box.h };
+  let w;
+  let h;
+  if (sw / sh >= box.w / box.h) {
+    /* 源更宽：贴满 box 宽，高按比例缩 */
+    w = box.w;
+    h = Math.round(box.w * sh / sw);
+  } else {
+    /* 源更高：贴满 box 高（本设备常态，2.16:1 < 4.75:1） */
+    h = box.h;
+    w = Math.round(box.h * sw / sh);
+  }
+  /* 偶数对齐（KMS/解码器喜欢偶数尺寸），向上取偶后不得越出 box */
+  w += w % 2;
+  h += h % 2;
+  if (w > box.w) w -= 2;
+  if (h > box.h) h -= 2;
+  return {
+    x: box.x + Math.round((box.w - w) / 2),
+    y: box.y + Math.round((box.h - h) / 2),
+    w: w,
+    h: h
+  };
+}
+
+/* '2532x1170' → {w:2532,h:1170}；解析失败返回 null */
+function parseResolution(s) {
+  if (typeof s !== 'string') return null;
+  const m = s.match(/^(\d{2,5})[xX](\d{2,5})$/);
+  if (!m) return null;
+  return { w: parseInt(m[1], 10), h: parseInt(m[2], 10) };
+}
 
 /* 米哈游错误码 → 人话。词典笔做不了极验，所以 -3101 必须明确告诉用户"去手机上完成"，
  * 否则用户会对着笔干等。 */
@@ -445,6 +483,13 @@ export default {
       statText: '等待画面',
       statOk: false,
       latencyText: '延迟 --',
+      /* 顶栏浮层（5Hz 轮询 status() 刷新；player.js 不透传 packetsLost 时显示 --） */
+      plTop: 'fps --',
+      plLat: 'latency --',
+      plBr: 'bitrate --',
+      plAudio: '--',
+      plLost: '--',
+      plErr: '',
 
       /* 协议层 / native 状态 */
       nativeOk: false,
@@ -516,6 +561,12 @@ export default {
     this._pollT = 0;
     this._statT = 0;
     this._bgPaused = false;
+    /* 当前视频矩形（源宽高比适配后），start 与 touch 共用同一份 */
+    this._rect = fitEvenRect(PROFILE_SRC.w, PROFILE_SRC.h, VIDEO_BOX);
+    /* 最近一次成功调度的 sdkParam：onHide stop 后回前台用它重新 start */
+    this._sdkParam = '';
+    /* screenOff 时重试唤屏的节流时间戳（5s 一次，别 5Hz 猛调 hal-screen） */
+    this._soRetryT = 0;
 
     /* 协议层是编译期静态 import 的（见 ys_client.js），这里只探测两件运行期事实：
      * ① protoReady —— 协议层函数齐不齐（缺函数说明打包被 tree-shake 了）
@@ -528,6 +579,20 @@ export default {
       ' nativeOk=' + this.nativeOk + ' player可用=' + player.isAvailable() +
       (this.nativeOk ? '' : ' 原因=' + (ys.nativeReason() || '未知'))
     );
+    /* player.js 是异步预热（Falcon 没有 require，模块要走异步装载）。
+     * 页面初始化先预热一次，这样第一次进 playing 轮询 status() 时模块就绪，
+     * 不会闪一下 state:'idle' 的空状态。失败也不阻塞 boot —— start/stop
+     * 内部会自己再 await 一次。 */
+    Promise.resolve()
+      .then(() => player.ensureNative())
+      .then(() => {
+        if (this._dead) return;
+        logWarn('player 预热完成 available=' + player.isAvailable());
+        if (this.mode === 'playing') this.pollStatus();
+      })
+      .catch((e) => {
+        logWarn('player 预热失败: ' + ((e && e.message) || e));
+      });
     this.bootTick();
   },
 
@@ -885,24 +950,45 @@ export default {
       if (this._dead || myGen !== this._gen) return;
       const sdkParam = r && r.sdkParam;
       if (!sdkParam) {
-        this.showError(-3001, '调度返回缺少 sdkParam，无法播放', 'dispatch');
+        /* 真实协议下 dispatch() 只跑到 getNodesInfo（sdkParam 为空），
+         * 真参要走 dispatchPaas({confirmBilling:true}) —— 那是计费动作，
+         * 必须等 lead 安排时间窗后由二次确认弹层显式触发，这里绝不自动发。 */
+        this.showError(-3001, '调度返回缺少 sdkParam（计费连接待开启，请联系管理员安排时间窗）', 'dispatch');
         return;
       }
       this.dispStep = 3;
       logWarn('调度成功，sdkParam 长度=' + String(sdkParam).length);
+      /* 记住参：onHide 会 stop 画面，回前台时用它重新 start */
+      this._sdkParam = sdkParam;
+
+      /* 视频矩形 = 源宽高比适配进 box（不能拉伸填满 box）。
+       * 源尺寸优先级：status().gameW/gameH（解码后真实帧，此时多半还没起播拿不到）
+       * → dispatch 返回的 resolution（'2532x1170'）→ PROFILE 兜底。 */
+      let src = null;
+      try {
+        const st = player.status();
+        if (st && num(st.gameW) > 0 && num(st.gameH) > 0) {
+          src = { w: num(st.gameW), h: num(st.gameH) };
+        }
+      } catch (e) {}
+      if (!src && r) src = parseResolution(r.resolution);
+      if (!src) src = PROFILE_SRC;
+      this._rect = fitEvenRect(src.w, src.h, VIDEO_BOX);
+      logWarn('视频适配矩形 ' + JSON.stringify(this._rect) + ' 源=' + src.w + 'x' + src.h);
 
       this.mode = 'playing';
       this.videoReady = false;
       this.railVisible = true;
       this.paused = false;
       this.phSub = '正在连接视频流…';
+      this.plErr = '正在连接视频流…';
       this.statText = '连接中';
       this.syncKeep();
       this.startStatTimer();
 
       let res = null;
       try {
-        res = await player.start({ sdkParam: sdkParam, rect: VIDEO_RECT });
+        res = await player.start({ sdkParam: sdkParam, rect: this._rect || VIDEO_BOX });
       } catch (e) {
         res = { ok: false, code: 'THROW', error: (e && e.message) || String(e) };
       }
@@ -910,11 +996,13 @@ export default {
       if (res && res.ok) {
         this.videoReady = true;
         this.statOk = true;
+        this.plErr = '';
         logWarn('画面已上屏');
       } else {
         /* 不弹错误页：native 模块缺失时用户仍应看到完整 UI 并可以返回/重试，
-         * 否则调试阶段只能看到一片 error。把原因放在占位框里。 */
-        this.phSub = '画面未上屏：' + ((res && (res.error || res.code)) || '未知原因');
+         * 否则调试阶段只能看到一片 error。原因放进顶栏浮层（中间提示位）。 */
+        this.plErr = '画面未上屏：' + ((res && (res.error || res.code)) || '未知原因');
+        this.phSub = this.plErr;
         this.statText = '未上屏';
         logWarn('player.start 失败 code=' + ((res && res.code) || '?') + ' err=' + ((res && res.error) || ''));
       }
@@ -933,11 +1021,14 @@ export default {
     },
 
     /* ---------- playing ---------- */
+    /* 5Hz（200ms）：native 侧 jsapi_ysplayer.c 的注释就写着
+     * "on-screen debug overlay already polls status() at 5 Hz"，
+     * status() 只读内存计数器（seqlock），200ms 一次没有开销压力。 */
     startStatTimer() {
       if (this._statT) return;
       this._statT = this.every(() => {
         this.pollStatus();
-      }, 2000);
+      }, 200);
     },
     stopStatTimer() {
       if (!this._statT) return;
@@ -962,12 +1053,61 @@ export default {
       this.statText = Math.round(fps) + 'fps · ' + Math.round(br / 1000) + 'Mbps';
       this.latencyText = lat > 0 ? '延迟 ' + Math.round(lat) + 'ms' : '延迟 --';
       this.statOk = s.state === 'playing';
+      /* 顶栏浮层（左上 fps / latency，右上 bitrate / audio / lost） */
+      this.plTop = fps > 0 ? 'fps ' + Math.round(fps) : 'fps --';
+      this.plLat = lat > 0 ? 'latency ' + Math.round(lat) + 'ms' : 'latency --';
+      this.plBr = br > 0
+        ? (br >= 1000 ? 'bitrate ' + (br / 1000).toFixed(1) + 'Mbps' : 'bitrate ' + Math.round(br) + 'kbps')
+        : 'bitrate --';
+      this.plAudio = 'audio ' + (s.audioOk ? 'ok' : '断');
+      /* player.js 的 status() 目前不透传 native 的 packetsLost（其写域），
+       * 所以字段不存在时显示 --，不猜 0。 */
+      this.plLost = typeof s.packetsLost === 'number' && isFinite(s.packetsLost)
+        ? 'lost ' + s.packetsLost
+        : 'lost --';
       /* 注意：s.screenOff 为真只说明屏幕被系统熄了，**不代表播放失败**。
        * 熄屏时 planeActive 会变 0，如果按"planeActive=0 就是错误"处理，
-       * 用户只是让屏幕自动熄灭就会被弹到错误页。所以这里不做任何错误判定。 */
+       * 用户只是让屏幕自动熄灭就会被弹到错误页。所以这里不做错误判定，
+       * 只在浮层提示 + 节流重试唤屏（screen.js 没有导出 on()，
+       * keepScreenOnce 内部会做 keep + screenOnOff(1) 兜底）。 */
+      const now = Date.now();
+      if (s.screenOff) {
+        this.plErr = '屏幕已熄灭 · 正在唤屏';
+        if (now - this._soRetryT >= 5000) {
+          this._soRetryT = now;
+          try {
+            const ok = screen.keepScreenOnce();
+            logWarn('熄屏重试唤屏 keepScreenOnce→' + ok);
+          } catch (e) {
+            logWarn('熄屏重试唤屏失败: ' + ((e && e.message) || e));
+          }
+        }
+      } else if (this.plErr === '屏幕已熄灭 · 正在唤屏') {
+        this.plErr = '';
+      }
       if (s.state === 'paused') this.paused = true;
-      if (s.state === 'error') {
-        this.phSub = '播放异常：' + (s.lastErrorMsg || s.lastError || '未知');
+      /* 起播后 status() 会给出解码后的真实帧尺寸 gameW/gameH —— 若按它
+       * 适配出的矩形比当前**更小**（render-rectangle 单向棘轮只许缩），
+       * 就 setRect 精化一次并同步触摸映射；等比同尺寸（2.165:1 流常态）不动。 */
+      if (s.state === 'playing' && num(s.gameW) > 0 && num(s.gameH) > 0) {
+        const fit = fitEvenRect(s.gameW, s.gameH, VIDEO_BOX);
+        const cur = this._rect || VIDEO_BOX;
+        if (fit.w <= cur.w && fit.h <= cur.h && (fit.w !== cur.w || fit.h !== cur.h)) {
+          const r = player.setRect(fit);
+          if (r && r.ok !== false) {
+            this._rect = fit;
+            logWarn('视频矩形精化为 ' + JSON.stringify(fit));
+          }
+        }
+      }
+      /* player.js 新语义：模块预热中返回 state:'idle' + lastError:''，
+       * 不再是 error；判失败看 lastError 非空。 */
+      if (s.state === 'error' && s.lastError) {
+        this.plErr = '画面未上屏：' + (s.lastErrorMsg || s.lastError);
+        this.phSub = this.plErr;
+      } else if (s.state === 'playing') {
+        this.plErr = '';
+        this.videoReady = true;
       }
     },
     onTouchStart(e) {
@@ -979,21 +1119,35 @@ export default {
     onTouchEnd(e) {
       this.feedTouch(e, 'up');
     },
+    onTouchCancel(e) {
+      this.feedTouch(e, 'up');
+    },
     /* 触摸 → 归一化坐标。
-     * pageX/pageY 在 Falcon 里是**相对被触摸元素**的坐标，而触摸层正好铺满
-     * video rect，所以 (pageX - rect.x) 就等于相对 rect 的偏移。
-     * 关键：**不钳位** —— 超出 [0,1] 是游戏判断"拖出画面=取消"的信号，钳了会误操作。 */
+     * clientX/clientY 是 canvas 视口坐标（逻辑画布 960x266 原点），
+     * 与**适配后的视频矩形 this._rect**（KMS 面板坐标换算后的逻辑画布矩形）
+     * 同一坐标系 —— 归一化是相对游戏画面的，不是相对 960x202 的 box，
+     * 点到两侧留白会得到 <0 或 >1，保持不钳位（游戏侧自己忽略）。
+     * clientX 缺失时退回 pageX（相对 .pl-stage 触摸层，其原点=box 原点）+ 偏移。
+     * 关键：**绝对不许钳位** —— 超出 [0,1] 是游戏判断"拖出画面=取消"
+     * 的信号，钳了会把玩家的取消手势吃掉。 */
     feedTouch(e, action) {
       if (this.mode !== 'playing') return;
+      const rect = this._rect || VIDEO_BOX;
       const list = (e && e.changedTouches) || [];
       for (let i = 0; i < list.length; i++) {
         const t = list[i];
         if (!t) continue;
-        const nx = (num(t.pageX) - VIDEO_RECT.x) / VIDEO_RECT.w;
-        const ny = (num(t.pageY) - VIDEO_RECT.y) / VIDEO_RECT.h;
+        const cx = typeof t.clientX === 'number' && isFinite(t.clientX)
+          ? t.clientX
+          : num(t.pageX) + VIDEO_BOX.x;
+        const cy = typeof t.clientY === 'number' && isFinite(t.clientY)
+          ? t.clientY
+          : num(t.pageY) + VIDEO_BOX.y;
+        const nx = (cx - rect.x) / rect.w;
+        const ny = (cy - rect.y) / rect.h;
         const fid = typeof t.identifier === 'number' ? t.identifier : 0;
         try {
-          player.touch(nx, ny, action, fid);
+          player.touch({ nx: nx, ny: ny, action: action, fingerId: fid });
         } catch (err) {
           /* 播放层未就位时忽略，不要因为一次触摸失败打断 UI */
         }
@@ -1099,41 +1253,58 @@ export default {
     },
 
     /* ---------- 生命周期（由 BasePage 转发，见 base-page.js） ---------- */
-    onShow() {
+    async onShow() {
       logWarn('onShow mode=' + this.mode);
       this.syncKeep();
-      if (this.mode === 'playing' && this._bgPaused) {
-        this._bgPaused = false;
+      /* onHide 时我们把画面 stop 掉了（KMS 平面不随页面隐藏自动消失，
+       * 不 stop 会让桌面被冻结的游戏帧盖住）。回前台用记住的 sdkParam
+       * 重新 start —— start 内部会轮询到 playing 才 resolve。 */
+      if (this.mode === 'playing' && this._sdkParam && !this.videoReady) {
         const myGen = this._gen;
-        player.resume().then(
-          () => {
-            if (this._dead || myGen !== this._gen) return;
-            this.paused = false;
-            logWarn('回前台已恢复画面');
-          },
-          (e) => logWarn('回前台恢复失败: ' + ((e && e.message) || e))
-        );
+        this.plErr = '正在连接视频流…';
+        this.statText = '连接中';
+        try {
+          const res = await player.start({ sdkParam: this._sdkParam, rect: this._rect || VIDEO_BOX });
+          if (this._dead || myGen !== this._gen) return;
+          if (res && res.ok) {
+            this.videoReady = true;
+            this.statOk = true;
+            this.plErr = '';
+            logWarn('回前台画面已重新上屏');
+          } else {
+            this.plErr = '画面未上屏：' + ((res && (res.error || res.code)) || '未知原因');
+          }
+        } catch (e) {
+          logWarn('回前台重新 start 失败: ' + ((e && e.message) || e));
+        }
       }
     },
-    onHide() {
+    async onHide() {
       logWarn('onHide mode=' + this.mode);
-      /* 退后台：只暂停 + 停保活，**不 teardown**。
-       * 保活必须连定时器一起停，否则后台还每 20s 唤醒屏幕（烧屏 + 耗电）。 */
-      if (this.mode === 'playing' && this.videoReady && !this.paused) {
-        this._bgPaused = true;
+      /* 退后台：**必须 await player.stop()**（任务硬要求）。
+       * KMS 视频平面是 native 管的，页面隐藏它还在屏上，
+       * 不 stop 就会把桌面/下个应用盖住。保活也必须连定时器一起停，
+       * 否则后台还每 20s 唤醒屏幕（烧屏 + 耗电）。 */
+      this.stopStatTimer();
+      if (this.mode === 'playing') {
         try {
-          const p = player.pause();
-          if (p && p.then) p.then(null, function () {});
-        } catch (e) {}
-        this.paused = true;
+          await player.stop();
+          logWarn('onHide 画面已释放');
+        } catch (e) {
+          logWarn('onHide player.stop 失败: ' + ((e && e.message) || e));
+        }
+        this.videoReady = false;
+        this.statOk = false;
+        this.paused = false;
       }
       this.stopKeepScreen('onHide');
     },
     onUnload() {
       logWarn('onUnload');
+      /* teardown 内部 await player.stop()（见下） */
       this.teardown('onUnload');
     },
-    teardown(where) {
+    async teardown(where) {
       if (this._dead) return;
       this._dead = true;
       this._gen++;
@@ -1153,17 +1324,13 @@ export default {
       this._timers.clear();
       this.stopKeepScreen(where);
       /* KMS 平面不会随页面销毁自动消失，必须显式 stop ——
-       * 否则桌面会被一帧冻结的游戏画面盖住，这是本设备最脏的故障。 */
+       * 否则桌面会被一帧冻结的游戏画面盖住，这是本设备最脏的故障。
+       * player.stop() 幂等不抛，这里 await 到它真正完成。 */
       try {
-        const p = player.stop();
-        if (p && p.then) {
-          p.then(
-            () => logWarn('销毁时画面已释放'),
-            (e) => logWarn('销毁时 player.stop 失败: ' + ((e && e.message) || e))
-          );
-        }
+        await player.stop();
+        logWarn('销毁时画面已释放');
       } catch (e) {
-        logWarn('销毁时 player.stop 异常: ' + ((e && e.message) || e));
+        logWarn('销毁时 player.stop 失败: ' + ((e && e.message) || e));
       }
     }
   }

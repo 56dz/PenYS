@@ -34,29 +34,82 @@ const STOP_TIMEOUT_MS = 8000;
 
 let mod = null;
 let loadError = '';
+let warmPromise = null;
+let warmFailed = false;
 
+/* 模块形态：C 侧 JS_NewCModule 注册的 namespace，可能是 namespace 本身，
+ * 也可能是 { default: namespace }（rollup/quickjs 的 interop 差异）。 */
+function adopt(m) {
+  const x = (m && m.default) ? m.default : m;
+  if (!x || typeof x.status !== 'function') throw new Error('ysplayer 未导出 status()');
+  return x;
+}
+
+/* 真机实测：**Falcon 运行时没有 `require`**（`'require' is not defined`，
+ * /userdata/applog/DictPen_*.log），C 模块只能用动态 `import()` 加载 ——
+ * PenBili/PenDouyu 全项目零 require() 调用，用的都是 `await import(name)`。
+ * 但 status()/touch() 这些是同步 API，不能 await，所以这里用「异步预热 + 同步读缓存」：
+ * 模块一被 import 就发起预热，UI 首帧时大概率已就绪，没就绪时同步路径先回 idle。 */
+function doWarm() {
+  return (async () => {
+    try {
+      const g = (typeof globalThis !== 'undefined') ? globalThis : null;
+      let m = null;
+      if (g && g.__ysplayer) m = g.__ysplayer;          // 测试宿主注入点
+      else if (typeof require === 'function') m = require(MODULE);  // 老宿主兜底
+      else {
+        /* 真机教训（2026-11-05 两轮冷启动实测）：falcon 的 C 模块 loader 与
+         * app 实例同生命周期 —— boot 期 import('ysplayer') <1ms resolve，
+         * 而 onUnload 之后 loader 已被清掉，那时再 import 只会 reject 出
+         * could not load module filename。所以预热只在 boot 期发起一次
+         * （kickWarm 单发），另加 3s 超时兜底：宿主 import 万一悬空，
+         * ensureNative 也要能 settle、UI 要能拿到结论。 */
+        const p = import(MODULE);
+        p.then(
+          () => console.warn('[ysplayer] import resolve'),
+          (e) => console.warn('[ysplayer] import reject: ' + ((e && e.message) || e))
+        );
+        m = await Promise.race([
+          p,
+          new Promise((_, rej) => setTimeout(() => rej(new Error('import 超时 3000ms')), 3000)),
+        ]);
+      }
+      mod = adopt(m);
+      loadError = '';
+      warmFailed = false;
+      return mod;
+    } catch (e) {
+      loadError = (e && e.message) ? e.message : String(e);
+      warmFailed = true;
+      console.warn('[ysplayer] 加载失败: ' + loadError);
+      return null;
+    }
+  })();
+}
+
+function kickWarm() {
+  if (!warmPromise) warmPromise = doWarm();
+  return warmPromise;
+}
+
+/* 同步读缓存；没有就触发一次预热（不等待）。失败不重试，避免每次轮询刷屏。 */
 function loadModule() {
   if (mod) return mod;
-  if (loadError) return null;
-  try {
-    // Falcon 的 C 模块加载方式：require 模块名，默认导出即注册的 JS object
-    const m = require(MODULE);
-    mod = (m && m.default) ? m.default : m;
-    if (!mod) throw new Error('empty module');
-    return mod;
-  } catch (e) {
-    loadError = (e && e.message) ? e.message : String(e);
-    console.warn('[ysplayer] 加载失败: ' + loadError);
-    return null;
-  }
+  kickWarm();
+  return null;
+}
+
+/* 显式等待就绪。start()/stop() 与页面初始化走这里。 */
+export async function ensureNative() {
+  if (mod) return mod;
+  return kickWarm();
 }
 
 export function isAvailable() {
-  return !!loadModule();
+  return !!mod;
 }
 
 export function unavailableReason() {
-  loadModule();
   return loadError;
 }
 
@@ -65,10 +118,12 @@ export function unavailableReason() {
 export function status() {
   const m = loadModule();
   if (!m) {
+    // 还在预热 → 回 idle（UI 不该把「模块正在 import」当错误闪红）；
+    // 预热失败 → 才是真 error，带上具体原因。
     return {
-      ok: false, state: 'error', fps: 0, latencyMs: 0, bitrateKbps: 0,
-      audioOk: false, screenOff: false, planeActive: false,
-      lastError: loadError || 'native module missing',
+      ok: false, state: warmFailed ? 'error' : 'idle', fps: 0, latencyMs: 0, bitrateKbps: 0,
+      audioOk: false, screenOff: false, planeActive: false, packetsLost: 0,
+      lastError: loadError || (warmFailed ? 'native module missing' : ''),
     };
   }
   let s = null;
@@ -76,7 +131,7 @@ export function status() {
   if (!s || typeof s !== 'object') {
     return {
       ok: false, state: 'error', fps: 0, latencyMs: 0, bitrateKbps: 0,
-      audioOk: false, screenOff: false, planeActive: false,
+      audioOk: false, screenOff: false, planeActive: false, packetsLost: 0,
       lastError: 'status() returned nothing',
     };
   }
@@ -93,6 +148,8 @@ export function status() {
     audioCodec: s.audioCodec || '',
     gameW: Number(s.gameW) || 0,
     gameH: Number(s.gameH) || 0,
+    /* native status 有（jsapi_ysplayer.c:329），UI 播放浮层要显示丢包数 */
+    packetsLost: Number(s.packetsLost) || 0,
     lastError: s.lastError || '',
     lastErrorMsg: s.lastErrorMsg || '',
   };
@@ -128,7 +185,7 @@ function sleep(ms) {
  * 不是「请求已发出」。这一点很重要：UI 拿到 ok 就可以直接撤掉骨架屏。
  */
 export async function start({ sdkParam, rect } = {}) {
-  const m = loadModule();
+  const m = await ensureNative();
   if (!m) return { ok: false, code: 'NO_MODULE', error: loadError };
 
   const r = normalizeRect(rect);
@@ -220,7 +277,12 @@ export function touch(a, b, c, d) {
 /* 停一局。**必须幂等**：页面 onUnload、错误处理、用户返回主页都会调它，
  * 任何一次都不许抛异常，也不许无限等。 */
 export async function stop() {
-  const m = loadModule();
+  // 卸载路径专用守卫：boot 期预热从没发起过就不发起 —— falcon 在 onUnload 后
+  // 会清掉 C 模块 loader，此时 import 只会白报一条 could not load module
+  // filename（真机 2026-11-05）；而 boot 没 kick 意味着这个上下文从没 start()
+  // 过，native 侧没有需要停的东西。预热发起过就等它，绝不新开 import。
+  let m = mod;
+  if (!m && warmPromise) m = (await warmPromise) || null;
   if (!m) return { ok: true, skipped: 'NO_MODULE' };
   let res;
   try { res = m.stop(); } catch (e) { return { ok: false, error: String(e) }; }

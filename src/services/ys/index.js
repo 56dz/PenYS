@@ -139,6 +139,19 @@ export function nativeStatus() {
   };
 }
 
+/* ★ 异步预热 native 传输层（import('yshttp') 一次）。
+ * 页面初始化时 `await ensureNative()`，之后同步的 nativeStatus()/isAvailable()
+ * 只读缓存 —— falcon 运行时没有全局 require，只能走 import()。永不 reject。 */
+export function ensureNative() {
+  try {
+    return Promise.resolve(http.ensureNative()).then(function (m) {
+      return { http: !!m, reason: m ? '' : (http.unavailableReason() || '') };
+    });
+  } catch (e) {
+    return Promise.resolve({ http: false, reason: (e && e.message) || String(e) });
+  }
+}
+
 export { C as consts, http, storage, pb, login, dispatchMod, walletMod };
 
 /* default 聚合：ys_client.js 优先取这个。
@@ -160,4 +173,5 @@ export default {
   restore: restore,
   bootstrap: bootstrap,
   nativeStatus: nativeStatus,
+  ensureNative: ensureNative,
 };

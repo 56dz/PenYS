@@ -34,38 +34,88 @@ const MODULE = 'yshttp';
 let mod = null;
 let loadError = '';
 
-/* 懒加载：**绝不能在模块顶层 require('yshttp')**。
+/* ★ 真机根因（2026-11-05 YD_PEN_APP.log 实测）：
+ *   [ys/http] native 模块加载失败: 'require' is not defined
+ *   [ys] 页面创建 protoReady=true nativeOk=false ... 原因='require' is not defined
  *
- * 原因（这是一个会让整个 app 白屏的坑）：`ys_client.js` 是
- * `require('./ys/index.js')` 包在 try/catch 里的，但 try/catch 只能接住
- * 抛出的异常；如果 index.js 顶部就 require 一个不存在的 C 模块，异常会在
- * 模块实例化阶段抛出 —— 那时 index.vue 的 import 链已经断了，UI 直接白屏，
- * 用户看到的是黑屏而不是"native 缺失"的提示。
+ * falcon 运行时**根本不注入全局 require**（PenBili / PenDouyu 的 src 里
+ * grep 不到任何 require( 调用），所以旧写法 `m = require(MODULE)` 抛
+ * QuickJS ReferenceError -> 被 catch 吃掉 -> loadError 被永久设上 ->
+ * isAvailable() 恒 false -> 顶栏永远停在「协议层（native 未就绪）」。
  *
- * 所以所有 native 访问都走这里：函数内加载 + try/catch + 明确的错误对象。
- * 这里只有两个模块级变量（mod / loadError），import 时零 IO、零 require。
+ * 正确写法是 `await import('yshttp')`（PenBili/src/services/net.js:151 的
+ * 生产写法）；构建器把裸模块标 external + output.format='es'，字面量
+ * import('yshttp') 会原样进包，运行时由 registerCModuleLoader 解析。
+ *
+ * 约束：load() / isAvailable() 是同步的、被 UI 轮询调用，不能改成 async。
+ * 所以这里采用「异步预热 + 同步读缓存」：
+ *   ensureNative()  → await import('yshttp') 一次，结果写回模块级 mod
+ *   load()          → 只读缓存；读不到就点一次 import() 火并返回 null
  */
+
+/* 把模块命名空间规整成"真正能用的那个对象"。
+ * ys_jsapi.c 同时注册了 default 聚合与同名扁平具名导出，两种形态都要认。 */
+function hasNativeFns(o) {
+  return !!o && (typeof o.start === 'function' || typeof o.rttStart === 'function');
+}
+
+function pick(raw) {
+  if (!raw) return null;
+  if (hasNativeFns(raw)) return raw;          // 扁平命名空间（ys_jsapi.c:599-616）
+  if (raw.default && typeof raw.default === 'object') return raw.default;
+  return raw;
+}
+
+/* 裸模块名 -> 字面量动态 import()。
+ * 必须写字面量、不能写成 import(name)：falcon-module 插件只把**源码里
+ * 写死的裸模块 id** 标成 external，变量形式构建期解析不了。 */
+function importBare(name) {
+  if (name === 'yshttp') return import('yshttp');
+  if (name === 'ysws') return import('ysws');
+  return Promise.reject(new Error('未知 native 模块: ' + name));
+}
+
+/* 同步探路：测试注入 globalThis.__yshttp / require（仅当宿主真有 require）。
+ * 成功则写回 mod 并返回，失败返回 null 且**不缓存**，留给 import() 火。 */
+function probeSync() {
+  try {
+    const g = typeof globalThis !== 'undefined' ? globalThis : null;
+    let raw = null;
+    if (g && g.__yshttp) raw = g.__yshttp;
+    else if (typeof require === 'function') raw = require(MODULE);  // typeof 不抛 ReferenceError
+    const m = pick(raw);
+    if (hasNativeFns(m)) {
+      mod = m;
+      loadError = '';
+      return mod;
+    }
+    if (raw) loadError = MODULE + ' 缺少 start()';
+  } catch (e) {
+    // 只有宿主真的注入了 require 才可能走到这里（falcon 上不会）
+    loadError = (e && e.message) ? e.message : String(e);
+  }
+  return null;
+}
+
+/* ★ 页面初始化时先 `await ensureNative()` 一次（一次就够），
+ * 之后同步的 load() / isAvailable() 只读模块级缓存 mod。 */
+export function ensureNative() {
+  if (mod) return Promise.resolve(mod);
+  const m = probeSync();          // 测试注入 / require 存在时的回退
+  if (m) return Promise.resolve(m);
+  return startImportModule(MODULE);   // 与 nativeModule() 共用同一把火，只点一次
+}
+
+/* 懒加载：同步入口。绝不在模块顶层碰 native（会让 import 链断掉 -> 白屏）。
+ * 三段式：① 测试注入 ② require（仅当 typeof require === 'function'）
+ *         ③ import('yshttp') 点火（结果回填 mod，之后本函数直接命中缓存）。 */
 function load() {
   if (mod) return mod;
-  if (loadError) return null;
-  try {
-    // 测试注入点：设备上的独立 JS 宿主（.tmp/feas/net/jsrunner3）没有
-    // Falcon 的 require，但它会把 C 模块命名空间挂到 globalThis.__yshttp。
-    // 生产环境走下面的 require(MODULE)。
-    const g = typeof globalThis !== 'undefined' ? globalThis : null;
-    let m = g && g.__yshttp ? g.__yshttp : null;
-    if (!m) {
-      // Falcon 的 C 模块加载方式：require 模块名，默认导出即注册的 JS object
-      m = require(MODULE);
-    }
-    mod = (m && m.default) ? m.default : m;
-    if (!mod || typeof mod.start !== 'function') throw new Error('yshttp 缺少 start()');
-    return mod;
-  } catch (e) {
-    loadError = (e && e.message) ? e.message : String(e);
-    safeWarn('[ys/http] native 模块加载失败: ' + loadError);
-    return null;
-  }
+  const m = probeSync();
+  if (m) return m;
+  if (!loadError) loadError = MODULE + ' 尚未就绪（import() 预热中）';
+  startImportModule(MODULE);      // fire-and-forget，结果回填 mod / loadError
+  return null;
 }
 
 /* 构造一个 UI 能识别的错误对象。
@@ -109,17 +159,62 @@ export function unavailableReason() {
 
 /* 通用 native 模块加载器（yshttp / ysws 共用）。
  *
- * 两条路径：
- *   1. 生产：Falcon 注入 require()，C 模块用 `require('模块名')` 加载，
- *      命名空间对象上有一个 `default` 聚合。
- *   2. 设备侧独立 JS 宿主（.tmp/feas/net/jsrunner2，做真机验证用）：
- *      没有 require，把 C 模块命名空间直接挂到 globalThis.__yshttp / __ysws。
- *      这是为了让同一份 JS 代码在两种宿主下跑出可比的结果 ——
- *      否则"真机验证"验的是另一份代码。
+ * 三条路径，顺序与上面的 load() 一致：
+ *   1. 设备侧独立 JS 宿主（.tmp/feas/net/jsrunner2，做真机验证用）：
+ *      没有 import 之外的手段，把 C 模块命名空间挂到 globalThis.__yshttp / __ysws；
+ *   2. require —— 仅当 `typeof require === 'function'`。真机 falcon 没有 require
+ *      （实测 'require' is not defined），这个守卫只为了 Node 侧测试宿主；
+ *   3. import('模块名') 字面量 —— 生产路径，PenBili/src/services/net.js:151 已验证。
+ *
+ * 同步的 nativeModule() 只能读缓存；读不到就点一次 import() 火并返回 null。
+ * 调用方在 async 上下文里请用 `await ensureModule(name)`。
  */
 var moduleCache = {};
+var modulePending = {};
+var moduleErrors = {};
+
+export function moduleError(name) {
+  return moduleErrors[name] || '';
+}
+
+function startImportModule(name) {
+  if (modulePending[name]) return modulePending[name];
+  modulePending[name] = importBare(name).then(function (raw) {
+    var m = pick(raw);
+    var ok = hasNativeFns(m);
+    moduleCache[name] = ok ? m : null;
+    if (ok) {
+      delete moduleErrors[name];
+      if (name === MODULE) {
+        mod = m;
+        loadError = '';
+        safeWarn('[ys/http] native 模块 ' + name + ' import 预热完成');
+      }
+    } else {
+      moduleErrors[name] = name + ' 缺少 start()/rttStart()';
+      if (name === MODULE) {
+        mod = null;
+        loadError = moduleErrors[name];
+        safeWarn('[ys/http] native 模块 ' + name + ' 形态不对: ' + moduleErrors[name]);
+      }
+    }
+    return moduleCache[name];
+  }, function (e) {
+    var msg = (e && e.message) ? e.message : String(e);
+    moduleCache[name] = null;
+    moduleErrors[name] = msg;
+    if (name === MODULE) {
+      mod = null;
+      loadError = msg;
+    }
+    safeWarn('[ys/http] native 模块 ' + name + ' import 失败: ' + msg);
+    return null;
+  });
+  return modulePending[name];
+}
 
 export function nativeModule(name) {
+  if (name === MODULE && mod) return mod;
   if (moduleCache[name] !== undefined) return moduleCache[name];
   var m = null;
   try {
@@ -132,9 +227,27 @@ export function nativeModule(name) {
   } catch (e) {
     m = null;
   }
-  var mod2 = (m && m.default) ? m.default : m;
-  moduleCache[name] = mod2 || null;
-  return moduleCache[name];
+  var picked = pick(m);
+  if (hasNativeFns(picked)) {
+    moduleCache[name] = picked;
+    if (name === MODULE) {
+      mod = picked;
+      loadError = '';
+    }
+    return picked;
+  }
+  // 同步路径没拿到：**不要写缓存 null**（写了就永远是 null），
+  // 改成点一次 import() 火，让下一次调用 / await ensureModule 命中。
+  startImportModule(name);
+  return null;
+}
+
+/* ★ 异步拿任意 native 模块（yshttp / ysws）。解析成模块或 null，永不 reject。 */
+export function ensureModule(name) {
+  if (name === MODULE) return ensureNative();
+  var c = nativeModule(name);
+  if (c) return Promise.resolve(c);
+  return startImportModule(name);
 }
 
 /* ---- 小工具 ---- */
@@ -406,6 +519,9 @@ export default {
   ysError: ysError,
   isAvailable: isAvailable,
   unavailableReason: unavailableReason,
+  ensureNative: ensureNative,
+  ensureModule: ensureModule,
+  moduleError: moduleError,
   nativeModule: nativeModule,
   request: request,
   requestJson: requestJson,

@@ -1316,3 +1316,87 @@
   color: @ys-text-dim;
   letter-spacing: 2px;
 }
+
+/* ============ playing 浮层（方案 B：上下留边，浮层在视频 rect 之外） ============
+ * KMS 视频平面（Esmart1 zpos 2）盖住 VIDEO_RECT{0,24,960,202} 内的一切 UI，
+ * 所以三段式 flex 列：顶 24px 状态条 / 中 202px 视频+触摸区 / 底 40px 操作条。
+ * 视频区（.pl-stage）不放任何不透明背景，保持根节点透明。 */
+.pl-top {
+  width: 960px;
+  height: 24px;
+  flex-direction: row;
+  align-items: center;
+  padding-left: 6px;
+  padding-right: 6px;
+  background-color: @ys-rail-bg;
+  border-bottom-width: 1px;
+  border-color: @ys-gold-line-2;
+}
+
+.pl-chipgrp {
+  flex-direction: row;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.pl-chip {
+  margin-right: 6px;
+  flex-direction: row;
+  align-items: center;
+}
+
+/* 中间提示位：吸收多余宽度并居中（flex-grow 弹簧，不用 margin:auto） */
+.pl-hint {
+  flex-grow: 1;
+  flex-shrink: 1;
+  flex-basis: 0px;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+}
+
+.pl-hint-idle {
+  /* 无提示时不占视觉重量，但保留占位防止左右两组挤在一起 */
+  opacity: 0;
+}
+
+.pl-hint-warn {
+  opacity: 1;
+}
+
+.pl-chiptxt {
+  font-size: 11px;
+  color: @ys-text-dim;
+  letter-spacing: 1px;
+}
+
+.pl-chiptxt-warn {
+  color: @ys-gold;
+}
+
+.pl-chiptxt-dim {
+  color: @ys-text-dim;
+}
+
+/* 中间视频/触摸区：只占剩余空间，不设背景（透明根节点透出 KMS 视频） */
+.pl-stage {
+  width: 960px;
+  height: 0px;
+  flex-grow: 1;
+  flex-shrink: 1;
+  flex-basis: 0px;
+  flex-direction: column;
+}
+
+/* 底部操作条：返回 / 暂停·继续 + 弹簧 + 状态小字 */
+.pl-bar {
+  width: 960px;
+  height: 40px;
+  flex-direction: row;
+  align-items: center;
+  padding-left: 8px;
+  padding-right: 8px;
+  background-color: @ys-rail-bg;
+  border-top-width: 1px;
+  border-color: @ys-gold-line-2;
+}
