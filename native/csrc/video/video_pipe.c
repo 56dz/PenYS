@@ -489,24 +489,23 @@ static int vp_build(ys_video_t *v) {
         goto fail;   /* k=0：5 个元素都还没入 bin，由 fail 路径逐个释放一次 */
     }
 
-    if (!gst_element_link(src, parse) || !gst_element_link(parse, dec) ||
-        !gst_element_link(dec, q) || !gst_element_link(q, sink)) {
-        snprintf(v->error_msg, sizeof v->error_msg, "build: gst_element_link failed");
-        goto fail;   /* 尚未入 bin：fail 路径把 5 个元素全部释放 */
-    }
-    {   /* 诊断：链接后立刻验证 vsrc:src 的 peer 是否真的挂上了 */
-        vp_log_peer("build/link", src);
-    }
+    /* 必须先全部入 bin 再 link：真机最小复现（.tmp/feas/media/src/binadd_repro.c）
+     * 证明本机 GStreamer 里 link 后再 gst_bin_add(已 link 的元素) 会把该元素的
+     * pad 链接整个断开（双向 peer 变 NULL → 首推 gst_pad_push 返回 NOT_LINKED）；
+     * add-then-link（gst-launch/rtpprobe 的顺序）则正常。 */
     for (k = 0; k < 5; k++) {
         if (!gst_bin_add((GstBin *)p, e[k])) {
             snprintf(v->error_msg, sizeof v->error_msg, "build: gst_bin_add failed");
             goto fail;   /* e[0..k) 归 p，e[k..4] 归本函数 */
         }
-        {
-            char tag[40];
-            snprintf(tag, sizeof tag, "build/add[%d]", k);
-            vp_log_peer(tag, src);
-        }
+    }
+    if (!gst_element_link(src, parse) || !gst_element_link(parse, dec) ||
+        !gst_element_link(dec, q) || !gst_element_link(q, sink)) {
+        snprintf(v->error_msg, sizeof v->error_msg, "build: gst_element_link failed");
+        goto fail;   /* k=5：5 个元素都已在 p 里，由 fail 路径释放 p */
+    }
+    {   /* 诊断：入 bin+link 后验证 vsrc:src 的 peer 真的挂上了 */
+        vp_log_peer("build/link", src);
     }
 
     /* ---- appsrc：Annex-B byte-stream AU；block=false 保证 push 永不阻塞 ---- */
