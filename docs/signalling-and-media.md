@@ -78,10 +78,19 @@ session ERROR DTLS_FAIL: handshake timed out after 6000 ms (6 retransmissions)
 
 ### 剩下的假设（按可能性排序，下一位从这里继续）
 
-1. **answer 里的 `a=candidate` 填错了**：现在 `cfg.candidate_ip/candidate_port` 填的是
-   `game_svr_addr`（服务端自己的地址），等于向服务端宣告「我的 candidate 就是你的地址」。
-   ICE 语义上这里应该是**本机地址 + 本机 UDP 端口**（`getsockname(W.udp_fd)`）。
-   这是已定位、尚未修的设计缺陷，优先怀疑。
+1. ~~**answer 里的 `a=candidate` 填错了**~~ —— 已改，**尚未真机验证**（笔已关机）。
+   原来 `cfg.candidate_ip/candidate_port` 填的是 `game_svr_addr`（服务端自己的地址），
+   等于向服务端宣告「我的 candidate 就是你的地址」。现在：
+   - `w_open_udp()` 在**发 answer 之前**就把媒体 socket 建好（`connect()` 会绑定本地地址 +
+     临时端口），`getsockname()` 拿到真实的本地 endpoint；
+   - answer 里写的是 `a=candidate:1 1 udp 2130706431 <本机IP> <本机端口> typ host`；
+   - answer 之后再用 `sig_send_candidate()` 把同一个 candidate **通过信令 trickle 出去**
+     （浏览器 SDK 就是这么做的：`onicecandidate` → `{type:'candidates'}`）。
+   若边缘按「已信令的 remote candidate」白名单过滤 check，这一条才是关键；
+   若它不是这么实现的，那这一步只是让 SDP 不再撒谎。
+   真机验证方法：开机后跑一轮，看
+   `udp: connected to ... local=<ip>:<port>`、`sig: local candidate sent (...)`、
+   以及 `ice: reply #0` 是否出现。
 2. 媒体边缘对「源地址未通过某种准入」的流量静默丢弃：可能要求先连 TCP `svr_port`
    完成可靠通道/加入流程，UDP 口才对这对 5-tuple 开放。
 3. `rtc_udp_port` 不是公网媒体口，真正的媒体地址在别的机器上（比如 WSS 边缘主机）。

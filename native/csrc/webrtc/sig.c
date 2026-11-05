@@ -41,6 +41,7 @@ struct sig {
 
     /* StartGameReq strings. Same idea as the buffers above: the caller's
      * storage may die the moment sig_create() returns. */
+    char cfg_local_cand_ip[64];
     char cfg_game_token[512];
     char cfg_account_id[128];
     char cfg_sid[256];
@@ -341,6 +342,8 @@ static void copy_cfg_strings(sig_conn_t *s, const sig_cfg_t *cfg)
              cfg->candidate_ip ? cfg->candidate_ip : "");
     snprintf(s->cfg_local_ip, sizeof(s->cfg_local_ip), "%s",
              cfg->local_ip ? cfg->local_ip : "");
+    snprintf(s->cfg_local_cand_ip, sizeof(s->cfg_local_cand_ip), "%s",
+             cfg->local_cand_ip ? cfg->local_cand_ip : "");
     snprintf(s->cfg_game_token, sizeof(s->cfg_game_token), "%s",
              cfg->game_token ? cfg->game_token : "");
     snprintf(s->cfg_account_id, sizeof(s->cfg_account_id), "%s",
@@ -356,6 +359,7 @@ static void copy_cfg_strings(sig_conn_t *s, const sig_cfg_t *cfg)
     s->cfg.subprotocols = s->cfg_subproto[0] ? s->cfg_subproto : NULL;
     s->cfg.fingerprint = s->cfg_fp[0] ? s->cfg_fp : NULL;
     s->cfg.candidate_ip = s->cfg_cand_ip[0] ? s->cfg_cand_ip : NULL;
+    s->cfg.local_cand_ip = s->cfg_local_cand_ip[0] ? s->cfg_local_cand_ip : NULL;
     s->cfg.local_ip = s->cfg_local_ip[0] ? s->cfg_local_ip : NULL;
     s->cfg.game_token = s->cfg_game_token;
     s->cfg.account_id = s->cfg_account_id;
@@ -934,6 +938,8 @@ int sig_build_answer(sig_conn_t *s, char *out, size_t cap)
     cfg.accept_datachannel = s->cfg.accept_datachannel;
     cfg.candidate_ip = s->cfg.candidate_ip;
     cfg.candidate_port = s->cfg.candidate_port;
+    cfg.local_cand_ip = s->cfg.local_cand_ip;
+    cfg.local_cand_port = s->cfg.local_cand_port;
     cfg.ice_ufrag_out = s->local_ice_ufrag;
     cfg.ice_ufrag_out_cap = sizeof(s->local_ice_ufrag);
     cfg.ice_pwd_out = s->local_ice_pwd;

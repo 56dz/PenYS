@@ -341,6 +341,11 @@ typedef struct {
     dtls_client_t *dtls;
     int            udp_fd;
     struct sockaddr_in peer;
+    /* Local endpoint of the media socket. The answer SDP must advertise THIS,
+     * not the server's own address, otherwise our ICE checks are dropped as
+     * coming from an unknown peer. */
+    char           udp_local_ip[48];
+    int            udp_local_port;
     srtp_ctx       srtp;
     rtp_depay     *depay;
     ys_video_t    *video;
@@ -480,6 +485,86 @@ static void w_close_ctl(void) {
     if (W.ctl) { wss_close(W.ctl); W.ctl = NULL; }
 }
 
+/* Bind + connect the media socket and remember the local endpoint.
+ *
+ * Called from w_run_session() *before* the signalling handshake, because the
+ * SDP answer has to advertise the address we will actually send from. It used
+ * to be created after the answer was already on the wire, so the answer
+ * carried the server's own address as "our" candidate -- an ICE check coming
+ * from our real port then looks like an unknown peer and is dropped without
+ * an error, which is precisely the silent DTLS timeout we chased. */
+static int w_open_udp(void) {
+    char ip[48];
+    int p = 0;
+    const char *colon = strchr(W.sdk.game_svr_addr, ':');
+    struct in_addr ia;
+
+    if (!colon) { w_fail(YS_ERR_UDP, "game_svr_addr 缺端口"); return -1; }
+    {
+        size_t hl = (size_t)(colon - W.sdk.game_svr_addr);
+        if (hl == 0 || hl >= sizeof(ip)) { w_fail(YS_ERR_UDP, "game_svr_addr 非法"); return -1; }
+        memcpy(ip, W.sdk.game_svr_addr, hl);
+        ip[hl] = '\0';
+        p = atoi(colon + 1);
+    }
+    if (p <= 0 || p > 65535) { w_fail(YS_ERR_UDP, "game_svr_addr 端口非法"); return -1; }
+    /* game_svr_addr carries the reliable/TCP port (120.232.47.14:13600 in a
+     * real dispatch); the media plane lives on rtc_udp_port (13601). The web
+     * SDK rewrites every candidate to game_svr_ip:rtc_udp_port, so DTLS must
+     * go there -- knocking on the TCP port looks like a dead peer and burns
+     * the whole handshake budget in retransmissions. */
+    if (W.sdk.rtc_udp_port > 0 && W.sdk.rtc_udp_port <= 65535 &&
+        W.sdk.rtc_udp_port != p) {
+        ys_logf("udp: using rtc_udp_port=%d instead of game_svr_addr port %d",
+                W.sdk.rtc_udp_port, p);
+        p = W.sdk.rtc_udp_port;
+    }
+    if (inet_pton(AF_INET, ip, &ia) != 1) { w_fail(YS_ERR_UDP, "game_svr_addr 不是 IPv4"); return -1; }
+
+    memset(&W.peer, 0, sizeof(W.peer));
+    W.peer.sin_family = AF_INET;
+    W.peer.sin_addr = ia;
+    W.peer.sin_port = htons((uint16_t)p);
+
+    W.udp_fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (W.udp_fd < 0) { w_fail(YS_ERR_UDP, "socket() 失败"); return -1; }
+    {
+        /* A cloud-game client must tolerate 100 ms of jitter without the
+         * kernel queue overflowing and silently dropping DTLS retransmits
+         * later on. 256 KiB is well under the sysctl cap on this firmware. */
+        int rcvbuf = 256 * 1024;
+        setsockopt(W.udp_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
+    }
+    if (connect(W.udp_fd, (struct sockaddr *)&W.peer, sizeof(W.peer)) != 0) {
+        w_fail(YS_ERR_UDP, "connect(udp) 失败");
+        close(W.udp_fd); W.udp_fd = -1;
+        return -1;
+    }
+    /* Non-blocking after the handshake; DTLS needs blocking-ish slices but we
+     * drive it with its own poll loop, so non-blocking is correct and lets the
+     * same fd serve RTP afterwards. */
+    {
+        int fl = fcntl(W.udp_fd, F_GETFL, 0);
+        if (fl >= 0) fcntl(W.udp_fd, F_SETFL, fl | O_NONBLOCK);
+    }
+    {
+        struct sockaddr_in self;
+        socklen_t slen = sizeof(self);
+        W.udp_local_ip[0] = '\0';
+        W.udp_local_port = 0;
+        if (getsockname(W.udp_fd, (struct sockaddr *)&self, &slen) == 0) {
+            if (inet_ntop(AF_INET, &self.sin_addr, W.udp_local_ip,
+                          sizeof(W.udp_local_ip)) == NULL)
+                W.udp_local_ip[0] = '\0';
+            W.udp_local_port = (int)ntohs(self.sin_port);
+        }
+    }
+    ys_logf("udp: connected to %s:%d (rtc_udp_port=%d, local=%s:%d)",
+            ip, p, W.sdk.rtc_udp_port,
+            W.udp_local_ip[0] ? W.udp_local_ip : "?", W.udp_local_port);
+    return 0;
+}
+
 /* Decode sdk_param and bring up UDP + DTLS + SRTP. Returns 0 on success. */
 static int w_bring_up_media(void) {
     unsigned char *raw;
@@ -497,63 +582,9 @@ static int w_bring_up_media(void) {
             W.sdk.sid, W.sdk.game_svr_addr, W.sdk.rtc_udp_port,
             W.sdk.wss_url, W.sdk.ctl_url[0] ? W.sdk.ctl_url : "(none)");
 
-    /* ---- UDP socket. Bound to a local ephemeral port and connected to the
-     * fixed peer, so that non-peer packets are filtered by the kernel instead
-     * of by us. AF_INET explicitly: see the AF_UNSPEC 15-second trap. ---- */
-    {
-        char ip[48];
-        int p = 0;
-        const char *colon = strchr(W.sdk.game_svr_addr, ':');
-        struct in_addr ia;
-        if (!colon) { w_fail(YS_ERR_UDP, "game_svr_addr 缺端口"); return -1; }
-        {
-            size_t hl = (size_t)(colon - W.sdk.game_svr_addr);
-            if (hl == 0 || hl >= sizeof(ip)) { w_fail(YS_ERR_UDP, "game_svr_addr 非法"); return -1; }
-            memcpy(ip, W.sdk.game_svr_addr, hl);
-            ip[hl] = '\0';
-            p = atoi(colon + 1);
-        }
-        if (p <= 0 || p > 65535) { w_fail(YS_ERR_UDP, "game_svr_addr 端口非法"); return -1; }
-        /* game_svr_addr carries the reliable/TCP port (120.232.47.14:13600 in a
-         * real dispatch); the media plane lives on rtc_udp_port (13601). The
-         * web SDK rewrites every candidate to game_svr_ip:rtc_udp_port, so DTLS
-         * must go there -- knocking on the TCP port looks like a dead peer and
-         * burns the whole handshake budget in retransmissions. */
-        if (W.sdk.rtc_udp_port > 0 && W.sdk.rtc_udp_port <= 65535 &&
-            W.sdk.rtc_udp_port != p) {
-            ys_logf("udp: using rtc_udp_port=%d instead of game_svr_addr port %d",
-                    W.sdk.rtc_udp_port, p);
-            p = W.sdk.rtc_udp_port;
-        }
-        if (inet_pton(AF_INET, ip, &ia) != 1) { w_fail(YS_ERR_UDP, "game_svr_addr 不是 IPv4"); return -1; }
-
-        memset(&W.peer, 0, sizeof(W.peer));
-        W.peer.sin_family = AF_INET;
-        W.peer.sin_addr = ia;
-        W.peer.sin_port = htons((uint16_t)p);
-
-        W.udp_fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-        if (W.udp_fd < 0) { w_fail(YS_ERR_UDP, "socket() 失败"); return -1; }
-        {
-            /* A cloud-game client must tolerate 100 ms of jitter without the
-             * kernel queue overflowing and silently dropping DTLS retransmits
-             * later on. 256 KiB is well under the sysctl cap on this firmware. */
-            int rcvbuf = 256 * 1024;
-            setsockopt(W.udp_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-        }
-        if (connect(W.udp_fd, (struct sockaddr *)&W.peer, sizeof(W.peer)) != 0) {
-            w_fail(YS_ERR_UDP, "connect(udp) 失败");
-            close(W.udp_fd); W.udp_fd = -1;
-            return -1;
-        }
-        /* Non-blocking after the handshake; DTLS needs blocking-ish slices but
-         * we drive it with its own poll loop, so non-blocking is correct and
-         * lets the same fd serve RTP afterwards. */
-        {
-            int fl = fcntl(W.udp_fd, F_GETFL, 0);
-            if (fl >= 0) fcntl(W.udp_fd, F_SETFL, fl | O_NONBLOCK);
-        }
-        ys_logf("udp: connected to %s:%d (rtc_udp_port=%d)", ip, p, W.sdk.rtc_udp_port);
+    /* ---- UDP socket: opened before signalling so that the answer can
+     * advertise the port we actually send from (see w_open_udp). ---- */
+    if (W.udp_fd < 0 && w_open_udp() != 0) return -1;
 
         /* ---- ICE connectivity check.
          *
@@ -619,7 +650,6 @@ static int w_bring_up_media(void) {
                         (ru && ru[0]) ? 1 : 0, (lu && lu[0]) ? 1 : 0);
             }
         }
-    }
 
     /* ---- DTLS. ECDSA P-256: RSA-2048 costs 182-409 ms of certificate
      * generation on this A35, ECDSA is 0-1 ms.
@@ -726,6 +756,22 @@ static int w_send_answer(void) {
     }
     ys_logf("sig: answer sent (video pt=%d audio pt=%d)",
              sig_video_payload_type(W.sig), sig_audio_payload_type(W.sig));
+
+    /* Trickle our endpoint as well. The browser SDK forwards every local
+     * candidate over the same WSS channel; an edge that whitelists checks by
+     * the signalled remote candidate drops ours silently otherwise, which
+     * looks exactly like a dead port (no error, no ICMP, DTLS retransmits
+     * until the budget runs out). */
+    if (W.udp_local_ip[0] && W.udp_local_port > 0) {
+        char cand[160];
+        snprintf(cand, sizeof(cand),
+                 "candidate:1 1 udp 2130706431 %s %d typ host",
+                 W.udp_local_ip, W.udp_local_port);
+        if (sig_send_candidate(W.sig, cand) < 0)
+            ys_logf("sig: local candidate send failed: %s", sig_last_error(W.sig));
+        else
+            ys_logf("sig: local candidate sent (%s)", cand);
+    }
 
     return 0;
 }
@@ -987,6 +1033,14 @@ static int w_run_session(void) {
         free(raw);
     }
 
+    /* --- 0b. media socket FIRST.
+     *
+     * The answer SDP has to advertise the port WE send from, and we cannot
+     * know it until the socket is bound. Opening it here (instead of after the
+     * answer) also means the ICE check and its reply share the fd/5-tuple the
+     * server already saw in the SDP. --- */
+    if (w_open_udp() != 0) return -1;
+
         /* --- 1. DTLS certificate FIRST.
      *
      * sig_cfg_t carries our fingerprint, and sig.c needs it the moment it
@@ -1008,9 +1062,6 @@ static int w_run_session(void) {
     {
         uint32_t t0 = ys_mono_ms();
         char url[512];
-        char cand_ip[48];
-        int cand_port = 0;
-        const char *colon;
         sig_cfg_t cfg;
 
         if (split_hostport(W.sdk.wss_url, host, sizeof(host), &port, path, sizeof(path), 443) != 0) {
@@ -1040,24 +1091,15 @@ static int w_run_session(void) {
         snprintf(url, sizeof(url), "wss://%s:%d%s", host, port, path);
         ys_logf("wss: connecting to %s", url);
 
-        /* Candidate rewriting target. There is no STUN and no TURN on this
-         * service: the candidate the server sends is replaced wholesale by
-         * game_svr_addr:rtc_udp_port and the UDP socket is pinned there, so
-         * ICE degenerates into a direct connect to one fixed address. */
-        snprintf(cand_ip, sizeof(cand_ip), "%s", W.sdk.game_svr_addr);
-        colon = strchr(cand_ip, ':');
-        if (colon) {
-            cand_port = atoi(colon + 1);
-            *(char *)colon = '\0';
-        } else {
-            cand_ip[0] = '\0';
-        }
-
+        /* There is no STUN and no TURN on this service: the remote candidate
+         * is pinned to game_svr_addr:rtc_udp_port (see w_open_udp), so ICE
+         * degenerates into a direct connection to one fixed address. The
+         * answer advertises OUR endpoint, which the socket above set up. */
         memset(&cfg, 0, sizeof(cfg));
         cfg.url = url;
         cfg.fingerprint = dtls_local_fingerprint(W.dtls);
-        cfg.candidate_ip = cand_ip[0] ? cand_ip : NULL;
-        cfg.candidate_port = cand_port;
+        cfg.local_cand_ip = W.udp_local_ip[0] ? W.udp_local_ip : NULL;
+        cfg.local_cand_port = W.udp_local_port;
         cfg.local_ip = "0.0.0.0";          /* candidates arrive out of band */
         cfg.codecs = SDP_CODEC_H264 | SDP_CODEC_OPUS;
         cfg.sendrecv = 0;                  /* we receive only */

@@ -939,8 +939,13 @@ int sdp_build_answer(const sdp_offer_t *offer, const sdp_answer_cfg_t *cfg,
                 wb_printf(&w, "a=ssrc:%u cname:pen\r\n",
                           (unsigned)m->ssrcs[0]);
 
-            /* SBEM: a single candidate line keeps non-trickle peers happy. */
-            if (cfg->candidate_ip && cfg->candidate_port > 0) {
+            /* SBEM: a single candidate line keeps non-trickle peers happy.
+             * Prefer our real local endpoint: advertising the server's own
+             * address is an ICE lie that makes our checks look spoofed. */
+            if (cfg->local_cand_ip && cfg->local_cand_port > 0) {
+                wb_printf(&w, "a=candidate:1 1 udp 2130706431 %s %d typ host\r\n",
+                          cfg->local_cand_ip, cfg->local_cand_port);
+            } else if (cfg->candidate_ip && cfg->candidate_port > 0) {
                 wb_printf(&w, "a=candidate:1 1 udp 2130706431 %s %d typ host\r\n",
                           cfg->candidate_ip, cfg->candidate_port);
             }

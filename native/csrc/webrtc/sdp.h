@@ -176,6 +176,12 @@ typedef struct {
     const char *candidate_ip;
     int         candidate_port;
 
+    /* Our own endpoint (local address + the port of the media socket). The
+     * answer must advertise THIS -- a candidate naming the server's address
+     * makes an ICE check from our real port look like an unknown peer. */
+    const char *local_cand_ip;
+    int         local_cand_port;
+
     /* Session id / version for o=. 0 = derive from wall clock. */
     unsigned long session_id;
     unsigned long session_version;

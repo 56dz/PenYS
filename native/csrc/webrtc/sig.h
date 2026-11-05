@@ -191,6 +191,12 @@ typedef struct {
      * client hello). That path is still useful against a mock/test server, and
      * it keeps this change from breaking anything that cannot supply a token.
      */
+    /* Our own media endpoint (local address + bound UDP port). Embedded in the
+     * answer as a=candidate so the peer sees the address our checks come from.
+     * NULL/0 = omit the line. */
+    const char *local_cand_ip;
+    int         local_cand_port;
+
     const char *game_token;  /* sdk_param field 4, "game_token"        */
     const char *account_id;  /* gamer/api/login .aid (StartGameReq 2)   */
     const char *sid;         /* sdk_param field 1                       */
