@@ -800,13 +800,15 @@ export default {
         this.loginState = 'Confirmed';
         this.loginStateText = '登录成功，正在进入…';
         this.stopPoll();
-        await this.finishLogin(myGen);
+        /* 把本次轮询拿到的 Confirmed 结果直接传下去：
+         * ticket 确认后已被消费，loginComplete 若回查会拿到 -502 */
+        await this.finishLogin(myGen, r);
       }
     },
-    async finishLogin(myGen) {
+    async finishLogin(myGen, confirmedStatus) {
       let r = null;
       try {
-        r = await ys.loginComplete(this.ticket);
+        r = await ys.loginComplete(this.ticket, confirmedStatus);
       } catch (e) {
         if (this._dead || myGen !== this._gen) return;
         this.showError(-502, '登录凭证无效：' + ((e && e.message) || '换票失败'), 'login');

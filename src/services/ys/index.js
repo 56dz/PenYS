@@ -64,8 +64,8 @@ export function loginPollStatus(ticket) {
   return login.loginPollStatus(ticket);
 }
 
-export function loginComplete(ticket) {
-  return login.loginComplete(ticket);
+export function loginComplete(ticket, knownStatus) {
+  return login.loginComplete(ticket, knownStatus);
 }
 
 export function logout() {

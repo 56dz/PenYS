@@ -368,11 +368,20 @@ export async function gamerLogin() {
   return res.data || {};
 }
 
-/* 第 6 步（对外）：Confirmed 之后把 3/4/5 串起来，落盘会话。 */
-export async function loginComplete(ticket) {
-  var st = await loginPollStatus(ticket);
-  if (st.status !== 'Confirmed') {
-    return { ok: false, status: st.status, message: '二维码未确认（当前 ' + st.status + '）' };
+/* 第 6 步（对外）：Confirmed 之后把 3/4/5 串起来，落盘会话。
+ *
+ * ticket 是一次性的：轮询里拿到 Confirmed 之后它就已经被消费，
+ * 再查同一个 ticket 服务端直接回 -502 登录凭证无效（真机 22:12 实测：
+ * poll #13 Confirmed 拿到 Set-Cookie，poll #14 回查即 -502）。
+ * 所以调用方必须把轮询里已拿到的 Confirmed 结果当 knownStatus 传进来，
+ * 不许回查；knownStatus 缺失或不是 Confirmed 时才回查一次兜底。 */
+export async function loginComplete(ticket, knownStatus) {
+  var st = knownStatus;
+  if (!st || st.status !== 'Confirmed') {
+    st = await loginPollStatus(ticket);
+    if (st.status !== 'Confirmed') {
+      return { ok: false, status: st.status, message: '二维码未确认（当前 ' + st.status + '）' };
+    }
   }
 
   await webVerifyForGame();

@@ -112,7 +112,7 @@ function call(name) {
 
 export function loginBeginQr() { return call('loginBeginQr'); }
 export function loginPollStatus(t) { return call('loginPollStatus', t); }
-export function loginComplete(t) { return call('loginComplete', t); }
+export function loginComplete(t, st) { return call('loginComplete', t, st); }
 export function logout() { return call('logout'); }
 export function fetchWallet() { return call('fetchWallet'); }
 export function fetchGears() { return call('fetchGears'); }
