@@ -143,3 +143,26 @@ this.later(() => {
   冷启动恢复会话的路径从不赋值（钱包走 cookie jar，所以看着还能显示剩余时长）。
   现在 `syncProfileFromSession()` 在 bootstrap 后补一次，并且 passport 只给 `mid`
   不给 `nickname` 时用 `mid` 兜底。
+
+## 5. 主机侧测试（不需要词典笔）
+
+`native/tests/sdp_cand_test.c` 用一份结构忠实于真实 offer 的 SDP 跑
+`sdp_build_answer()`，锁死 answer 里几条一旦写错就只表现为「服务端静默丢包」的东西：
+
+- `a=candidate` 必须是**我们自己的** `ip:port`（`cfg.local_cand_ip/local_cand_port`），
+  不能是 `game_svr_addr`——填错时对端会认为 check 来自陌生 peer，直接丢弃，没有任何报错；
+- 只给旧的 `candidate_ip/candidate_port` 时回退路径仍然有效；
+- 什么都不给时 answer 里不出现 `a=candidate`（纯 trickle 模式）；
+- answer 必须带我们生成的 `a=ice-ufrag` / `a=ice-pwd`（服务端拿它校验 STUN USERNAME
+  里的 `remote:local`，缺了同样是不回包）；
+- `a=group:BUNDLE` 不能包含被拒绝的 m-line（我们拒绝 `m=application`，所以只有 `0 1`）。
+
+跑法（zig 交叉编译到 Windows 主机，和真机库同一套工具链）：
+
+```sh
+ZIG_GLOBAL_CACHE_DIR="$TEMP/penys-zig-cache" ZIG_LOCAL_CACHE_DIR="$TEMP/penys-zig-cache-local" ./env/pyzig/ziglang/zig.exe cc -target x86_64-windows-gnu -O1   -I PenYS/native/csrc/webrtc -o .tmp/sdp_cand_test.exe   PenYS/native/tests/sdp_cand_test.c PenYS/native/csrc/webrtc/sdp.c
+./.tmp/sdp_cand_test.exe      # 退出码 0 = 全过
+```
+
+注意：`sdp.c` 里 `o=` 的随机数走 `RAND_bytes`（真机上是 libcrypto），主机测试在自己的
+文件里给了一个确定性 stub，所以不必链接 OpenSSL。

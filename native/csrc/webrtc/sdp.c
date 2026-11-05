@@ -760,6 +760,7 @@ int sdp_build_answer(const sdp_offer_t *offer, const sdp_answer_cfg_t *cfg,
 {
     wbuf_t w;
     int i, first_mid_done = 0;
+    int accepted[SDP_MAX_MEDIA];
     char ufrag[32], pwd[64];
     unsigned long sid, sver;
     const char *fp;
@@ -813,20 +814,35 @@ int sdp_build_answer(const sdp_offer_t *offer, const sdp_answer_cfg_t *cfg,
     wb_printf(&w, "s=-\r\n");
     wb_printf(&w, "t=0 0\r\n");
 
-    /* BUNDLE: echo the offer's group verbatim when it exists, otherwise group
-     * everything we accepted. Mids are preserved, so this is always valid. */
-    if (offer->n_bundle > 0) {
-        wb_printf(&w, "a=group:BUNDLE");
-        for (i = 0; i < offer->n_bundle; i++)
-            wb_printf(&w, " %s", offer->bundle_mids[i]);
-        wb_printf(&w, "\r\n");
-    } else {
-        wb_printf(&w, "a=group:BUNDLE");
-        for (i = 0; i < offer->n_media; i++)
-            if (offer->media[i].mid[0])
-                wb_printf(&w, " %s", offer->media[i].mid);
-        wb_printf(&w, "\r\n");
+    /* Which m-lines do we accept? Needed twice: once for the BUNDLE group,
+     * once for the m-line loop below. */
+    for (i = 0; i < offer->n_media && i < SDP_MAX_MEDIA; i++) {
+        int chosen;
+        accepted[i] = media_acceptable(&offer->media[i], cfg,
+                                       cfg->accept_datachannel, &chosen);
     }
+
+    /* BUNDLE: RFC 8843 7.3.3 forbids listing an m-line we rejected (the
+     * answer carries it with port 0). Echoing the offer's group verbatim
+     * kept a rejected m=application in the group, which strict peers reject. */
+    wb_printf(&w, "a=group:BUNDLE");
+    if (offer->n_bundle > 0) {
+        int b2, m2;
+        for (b2 = 0; b2 < offer->n_bundle; b2++) {
+            for (m2 = 0; m2 < offer->n_media && m2 < SDP_MAX_MEDIA; m2++) {
+                if (strcmp(offer->media[m2].mid, offer->bundle_mids[b2]) != 0)
+                    continue;
+                if (accepted[m2])
+                    wb_printf(&w, " %s", offer->bundle_mids[b2]);
+                break;
+            }
+        }
+    } else {
+        for (i = 0; i < offer->n_media && i < SDP_MAX_MEDIA; i++)
+            if (offer->media[i].mid[0] && accepted[i])
+                wb_printf(&w, " %s", offer->media[i].mid);
+    }
+    wb_printf(&w, "\r\n");
 
     wb_printf(&w, "a=msid-semantic: WMS\r\n");
 
