@@ -35,6 +35,12 @@
 
 #define CAINFO_PATH "/etc/ssl/certs/ca-certificates.crt"
 #define MAX_JAR_LINE 1400
+/* libcurl writes HttpOnly cookies with this prefix glued to the domain. It is
+ * 10 bytes long: hardcoding 11 (as we used to) made strncmp compare the
+ * literal's NUL against the first domain character, so every HttpOnly line was
+ * silently dropped on import and the v2 session cookies never came back. */
+#define JAR_HTTPONLY "#HttpOnly_"
+#define JAR_HTTPONLY_LEN (sizeof(JAR_HTTPONLY) - 1)
 
 /* ------------------------------------------------------------------ buffer */
 
@@ -173,7 +179,7 @@ static ys_jar *jar_get_locked(const char *key, int create) {
 static void jar_line_ident(const char *line, char *out, size_t outcap) {
     out[0] = 0;
     const char *p = line;
-    if (strncmp(p, "#HttpOnly_", 11) == 0) p += 11;
+    if (strncmp(p, JAR_HTTPONLY, JAR_HTTPONLY_LEN) == 0) p += JAR_HTTPONLY_LEN;
     const char *f[7];
     int nf = 0;
     const char *cur = p;
@@ -289,7 +295,8 @@ int ys_jar_import(const char *jar_key, const char *text) {
                 line[len] = 0;
                 jar_add_locked(j, line);
                 n++;
-            } else if (len > 11 && strncmp(p, "#HttpOnly_", 11) == 0) {
+            } else if (len > JAR_HTTPONLY_LEN &&
+                       strncmp(p, JAR_HTTPONLY, JAR_HTTPONLY_LEN) == 0) {
                 char line[MAX_JAR_LINE];
                 if (len >= sizeof(line)) len = sizeof(line) - 1;
                 memcpy(line, p, len);
