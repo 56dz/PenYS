@@ -1,0 +1,33 @@
+{
+  "name": "penys-app",
+  "appName": "PenYS",
+  "appid": "8002026110200003",
+  "version": "1.0.0",
+  "icon": "app_icon.png",
+  "description": "PenYS（有道 X6 Pro）：云·原神 云游戏客户端 —— 扫码登录 / 排队调度 / 视频播放（KMS 直出）",
+  "quickjs": {
+    "version": "20200705",
+    "bigNum": false
+  },
+  "simulator": {
+    "path": "",
+    "page": ""
+  },
+  "single-js-bundle": false,
+  "scripts": {
+    "build": "node ../env/node_modules/aiot-vue-cli/src/cli.js -q -p",
+    "build:dev": "node ../env/node_modules/aiot-vue-cli/src/cli.js",
+    "build:prod": "node ../env/node_modules/aiot-vue-cli/src/cli.js -c -q -p"
+  },
+  "keywords": [
+    "youdao",
+    "dictionary-pen",
+    "falcon",
+    "miniapp",
+    "genshin",
+    "cloud-gaming"
+  ],
+  "dependencies": {
+    "falcon-ui": "1.0.3"
+  }
+}

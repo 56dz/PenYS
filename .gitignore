@@ -1,0 +1,14 @@
+# 构建产物
+.falcon_/
+.falcon_tmp/
+*.amr
+libs/*.so
+*.o
+
+# 依赖
+node_modules/
+
+# 编辑器/系统
+.DS_Store
+Thumbs.db
+*.swp

@@ -1,0 +1,1318 @@
+@import "variables.less";
+
+// ============================================================================
+// PenYS 主样式（云·原神 UI 骨架）
+//
+// 画布：960 x 266（Falcon 合成面，setViewPort(960) 后 1:1 无缩放）
+//   物理面板 480x960 rotation=1，逻辑 (x,y,w,h) → 面板 (y, 960-(x+w), h, w)
+//
+// 视觉规则（全部纯 CSS，不用任何图片资源）：
+//   1) 底：linear-gradient 墨蓝三段；**每条都先用 background-color 兜底**，
+//      万一运行时不吃 background-image，页面仍然是完整可读的深蓝底而不是白底。
+//   2) 金：细描边一律 border-width:1px + border-color（不写 border 简写，
+//      falcon-styler 对简写的支持没验证过），描边色统一 rgba 金，保证"若隐若现"。
+//   3) 卡片：半透明 background-color（毛玻璃效果靠半透明近似，不用 blur —— 设备
+//      是 4xA35，blur 会把合成面拖垮）。
+//   4) 斜切/菱形：只用 transform: rotate(45deg) 的小方块，且全是**装饰**；
+//      即使运行时忽略 transform，退化成小金块也不影响任何布局与可读性。
+//   5) 动画：只动 opacity/transform，周期 >= 200ms，不碰宽高（避免触发布局）。
+//
+// Falcon 铁律（每一条都是真机踩出来的，改样式前先读）：
+//   - 每个 .vue 必须自带 <style lang="less" scoped> 并 @import 本文件，否则无样式；
+//   - `flex: 1` 简写无效 → 必须写 flex-grow / flex-shrink / flex-basis 三连；
+//   - `<text>` 的内容不能换行，否则整段不渲染；
+//   - 组合选择器/后代选择器不可靠 → 本文件全部单类名，靠命名区分；
+//   - 等价特异性靠源码顺序决胜 → 覆盖规则（如 .*-on）必须写在基础规则之后；
+//   - position:absolute 不可靠 → 布局全部用 flex 行列 + flex-grow 弹簧撑开。
+// ============================================================================
+
+/* ---------------- 根 ---------------- */
+.page {
+  width: 960px;
+  height: 266px;
+  flex-direction: column;
+  background-color: @ys-bg-deep;
+  background-image: linear-gradient(135deg, @ys-bg-deep 0%, @ys-bg-mid 58%, @ys-bg-soft 100%);
+}
+
+/* 播放态：视频由 KMS 平面盖在 UI 之下/之上，UI 只需要在"没有被平面覆盖"的地方
+   画控制条。底色仍保留深色，避免平面还没上来时闪白。 */
+/* 播放态：Falcon 合成面必须**完全透明**，否则会挡住下面的 KMS 视频平面。
+   这里绝不能有 background-color/background-image —— 半透明都不行，
+   合成 alpha 会让视频发暗。见 PenDouyu base.less 的 .page-live 同样写法。 */
+.page-play {
+  background-color: rgba(0, 0, 0, 0);
+}
+
+/* 顶部 1px 金线（整页装饰，boot/login/home 都有） */
+.deco-topline {
+  width: 960px;
+  height: 1px;
+  background-color: @ys-gold-line;
+}
+
+.deco-botline {
+  width: 960px;
+  height: 1px;
+  background-color: @ys-gold-line-2;
+}
+
+/* 菱形装饰（纯装饰，transform 失效时退化为小金方块） */
+.deco-gem {
+  width: 7px;
+  height: 7px;
+  background-color: @ys-gold;
+  transform: rotate(45deg);
+}
+
+.deco-gem-s {
+  width: 4px;
+  height: 4px;
+  background-color: @ys-gold-deep;
+  transform: rotate(45deg);
+}
+
+/* 通用垫片：Falcon 的 flex gap 支持未验证，用固定宽/高的空 div 撑间距最可靠 */
+.gap-4 { width: 4px; }
+.gap-6 { width: 6px; }
+.gap-8 { width: 8px; }
+.gap-10 { width: 10px; }
+.gap-12 { width: 12px; }
+.gap-16 { width: 16px; }
+.spacer {
+  flex-grow: 1;
+  flex-shrink: 1;
+  flex-basis: 0px;
+}
+.vgap-4 { height: 4px; }
+.vgap-6 { height: 6px; }
+.vgap-8 { height: 8px; }
+.vgap-10 { height: 10px; }
+.vgap-12 { height: 12px; }
+.vgap-16 { height: 16px; }
+.vspacer {
+  flex-grow: 1;
+  flex-shrink: 1;
+  flex-basis: 0px;
+}
+
+/* ---------------- 关键帧 ----------------
+ * 只动 opacity（GPU 合成，不触发布局）。实测 falcon-styler 会把 @keyframes
+ * 编成 "@KEYFRAME": {name: {prop: [{p,v}, ...]}}，animation 四件套也原样通过。
+ * 但保守起见，每个用到动画的元素都已保证"静态外观 == 动画终态"，
+ * 万一时序器不跑，界面依然是完整可读的。 */
+@keyframes gemPulse {
+  0% { opacity: 0.25; }
+  50% { opacity: 1; }
+  100% { opacity: 0.25; }
+}
+
+@keyframes fadeIn {
+  0% { opacity: 0; }
+  100% { opacity: 1; }
+}
+
+@keyframes blinkDot {
+  0% { opacity: 1; }
+  50% { opacity: 0.35; }
+  100% { opacity: 1; }
+}
+
+/* ---------------- 通用文字档 ----------------
+ * Falcon 的 <text> 不支持嵌套，同一行要显示不同字号/颜色的文字只能拆成兄弟节点，
+ * 所以把"小字/暗字/金色/危险色"做成可叠加的工具类，避免为每处文案新建语义类。
+ * 叠加时靠源码顺序决胜（写在后面的覆盖前面的），因此这些类必须放在 base.less 末尾。 */
+.tx-10 { font-size: 10px; color: @ys-text-mute; letter-spacing: 1px; }
+.tx-11 { font-size: 11px; color: @ys-text-dim; letter-spacing: 1px; }
+.tx-12 { font-size: 12px; color: @ys-text-dim; letter-spacing: 1px; }
+.tx-13 { font-size: 13px; color: @ys-text; letter-spacing: 1px; }
+.tx-gold { color: @ys-gold; }
+.tx-bright { color: @ys-gold-bright; }
+.tx-danger { color: @ys-danger; }
+.tx-ok { color: @ys-ok; }
+.tx-line { lines: 2; }
+
+/* ---------------- 通用按钮 ----------------
+ * 为什么按钮不写 border 简写：falcon-styler 的简写展开只对 padding/margin 做，
+ * border 简写会原样传给运行时，而运行时是否解析未经验证 —— 拆成三条零风险。 */
+.btn {
+  height: 30px;
+  padding-left: 14px;
+  padding-right: 14px;
+  border-width: 1px;
+  border-color: @ys-gold-line;
+  border-style: solid;
+  border-radius: 2px;
+  background-color: @ys-card-2;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+}
+
+.btn-text {
+  font-size: 13px;
+  color: @ys-text;
+  letter-spacing: 1px;
+}
+
+/* 按下/选中态：金边 + 金底 + 亮金字。等价特异性靠源码顺序，必须写在 .btn 之后。 */
+.btn-on {
+  border-color: @ys-gold;
+  background-color: rgba(211, 188, 142, 0.18);
+}
+
+.btn-on-text {
+  color: @ys-gold-bright;
+}
+
+.btn-primary {
+  height: 32px;
+  border-color: @ys-gold;
+  background-color: rgba(211, 188, 142, 0.22);
+}
+
+.btn-danger {
+  border-color: rgba(226, 112, 95, 0.55);
+  background-color: @ys-danger-bg;
+}
+
+/* 顶部/底部细条（信号条、协议条共用） */
+.strip {
+  width: 960px;
+  height: 24px;
+  padding-left: 14px;
+  padding-right: 14px;
+  flex-direction: row;
+  align-items: center;
+  background-color: @ys-card-3;
+}
+
+.strip-text {
+  font-size: 11px;
+  color: @ys-text-dim;
+  letter-spacing: 1px;
+}
+
+.strip-gap {
+  flex-grow: 1;
+  flex-shrink: 1;
+  flex-basis: 0px;
+}
+
+/* 小圆点指示器（信号强弱、在线状态） */
+.dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 3px;
+  background-color: @ys-ok;
+}
+
+.dot-warn {
+  background-color: @ys-warn;
+}
+
+.dot-bad {
+  background-color: @ys-danger;
+}
+
+/* ---------------- boot ---------------- */
+.boot-wrap {
+  width: 960px;
+  height: 265px;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+
+.boot-gem-row {
+  flex-direction: row;
+  align-items: center;
+  height: 12px;
+  margin-bottom: 10px;
+}
+
+.boot-gem {
+  width: 7px;
+  height: 7px;
+  background-color: @ys-gold;
+  transform: rotate(45deg);
+  margin-left: 5px;
+  margin-right: 5px;
+  opacity: 0.25;
+  animation-name: gemPulse;
+  animation-duration: 1200ms;
+  animation-timing-function: linear;
+  animation-iteration-count: infinite;
+}
+
+/* 五颗菱形错峰呼吸：只动 opacity，不触发重排（4xA35 上最省） */
+.boot-gem-2 { animation-delay: 160ms; }
+.boot-gem-3 { animation-delay: 320ms; }
+.boot-gem-4 { animation-delay: 480ms; }
+.boot-gem-5 { animation-delay: 640ms; }
+
+.boot-title {
+  font-size: 40px;
+  font-weight: 700;
+  color: @ys-gold-bright;
+  letter-spacing: 12px;
+  font-family: serif;
+  line-height: 1.2;
+}
+
+.boot-sub {
+  margin-top: 6px;
+  font-size: 13px;
+  color: @ys-gold;
+  letter-spacing: 5px;
+  opacity: 0.85;
+}
+
+.boot-hint {
+  margin-top: 12px;
+  font-size: 11px;
+  color: @ys-text-mute;
+  letter-spacing: 2px;
+}
+
+.boot-ver {
+  font-size: 10px;
+  color: @ys-text-mute;
+  letter-spacing: 1px;
+}
+
+.boot-foot {
+  width: 960px;
+  height: 22px;
+  padding-left: 14px;
+  padding-right: 14px;
+  flex-direction: row;
+  align-items: center;
+}
+
+/* ---------------- login ---------------- */
+.login-body {
+  width: 960px;
+  height: 242px;
+  flex-direction: row;
+  align-items: center;
+}
+
+.login-left {
+  width: 276px;
+  height: 242px;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+
+/* 二维码白底容器固定 236x236。
+ * 为什么是 236：login-body 只有 242 高（266 - 顶部信息条 24），留 3px 上下边，
+ * 而 4px 格子在版 1..8（size<=49 → 49+8 quiet = 57 格 → 228px）时正好装下。
+ * 版 9/10（53/57 格 → 61/65 格）会自动切到 3px 格子表（.qr-s-N），
+ * 见 index.vue 的 qrRowsOf()。容器尺寸恒定 → **不需要任何 inline style**。 */
+.qr-box {
+  width: 236px;
+  height: 236px;
+  background-color: #ffffff;
+  border-radius: 3px;
+  border-width: 1px;
+  border-color: @ys-gold;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+
+/* 二维码行/段：4px 基准 */
+.qr-row {
+  height: 4px;
+  flex-direction: row;
+}
+
+.qr-seg {
+  height: 4px;
+}
+
+.qr-dark {
+  background-color: #000000;
+}
+
+/* 版 9/10 用 3px 格（4px 会超出 236 容器并被 overflow:hidden 裁掉 → 扫不出来）。
+   两套段宽表都是静态类，行数/段宽全部由 JS 预先算好，零 inline style。 */
+.qr-row-s {
+  height: 3px;
+  flex-direction: row;
+}
+
+.qr-seg-s {
+  height: 3px;
+}
+
+/* 段宽表：每格 4px，最多 65 格（57 + 2*4 quiet）。全静态类，零 inline style。 */
+.qr-l-1 { width: 4px; }
+.qr-l-2 { width: 8px; }
+.qr-l-3 { width: 12px; }
+.qr-l-4 { width: 16px; }
+.qr-l-5 { width: 20px; }
+.qr-l-6 { width: 24px; }
+.qr-l-7 { width: 28px; }
+.qr-l-8 { width: 32px; }
+.qr-l-9 { width: 36px; }
+.qr-l-10 { width: 40px; }
+.qr-l-11 { width: 44px; }
+.qr-l-12 { width: 48px; }
+.qr-l-13 { width: 52px; }
+.qr-l-14 { width: 56px; }
+.qr-l-15 { width: 60px; }
+.qr-l-16 { width: 64px; }
+.qr-l-17 { width: 68px; }
+.qr-l-18 { width: 72px; }
+.qr-l-19 { width: 76px; }
+.qr-l-20 { width: 80px; }
+.qr-l-21 { width: 84px; }
+.qr-l-22 { width: 88px; }
+.qr-l-23 { width: 92px; }
+.qr-l-24 { width: 96px; }
+.qr-l-25 { width: 100px; }
+.qr-l-26 { width: 104px; }
+.qr-l-27 { width: 108px; }
+.qr-l-28 { width: 112px; }
+.qr-l-29 { width: 116px; }
+.qr-l-30 { width: 120px; }
+.qr-l-31 { width: 124px; }
+.qr-l-32 { width: 128px; }
+.qr-l-33 { width: 132px; }
+.qr-l-34 { width: 136px; }
+.qr-l-35 { width: 140px; }
+.qr-l-36 { width: 144px; }
+.qr-l-37 { width: 148px; }
+.qr-l-38 { width: 152px; }
+.qr-l-39 { width: 156px; }
+.qr-l-40 { width: 160px; }
+.qr-l-41 { width: 164px; }
+.qr-l-42 { width: 168px; }
+.qr-l-43 { width: 172px; }
+.qr-l-44 { width: 176px; }
+.qr-l-45 { width: 180px; }
+.qr-l-46 { width: 184px; }
+.qr-l-47 { width: 188px; }
+.qr-l-48 { width: 192px; }
+.qr-l-49 { width: 196px; }
+.qr-l-50 { width: 200px; }
+.qr-l-51 { width: 204px; }
+.qr-l-52 { width: 208px; }
+.qr-l-53 { width: 212px; }
+.qr-l-54 { width: 216px; }
+.qr-l-55 { width: 220px; }
+.qr-l-56 { width: 224px; }
+.qr-l-57 { width: 228px; }
+.qr-l-58 { width: 232px; }
+.qr-l-59 { width: 236px; }
+.qr-l-60 { width: 240px; }
+.qr-l-61 { width: 244px; }
+.qr-l-62 { width: 248px; }
+.qr-l-63 { width: 252px; }
+.qr-l-64 { width: 256px; }
+.qr-l-65 { width: 260px; }
+
+/* 3px 格表（版 9/10 用）：.qr-s-N 宽 = N*3 */
+.qr-s-1 { width: 3px; }
+.qr-s-2 { width: 6px; }
+.qr-s-3 { width: 9px; }
+.qr-s-4 { width: 12px; }
+.qr-s-5 { width: 15px; }
+.qr-s-6 { width: 18px; }
+.qr-s-7 { width: 21px; }
+.qr-s-8 { width: 24px; }
+.qr-s-9 { width: 27px; }
+.qr-s-10 { width: 30px; }
+.qr-s-11 { width: 33px; }
+.qr-s-12 { width: 36px; }
+.qr-s-13 { width: 39px; }
+.qr-s-14 { width: 42px; }
+.qr-s-15 { width: 45px; }
+.qr-s-16 { width: 48px; }
+.qr-s-17 { width: 51px; }
+.qr-s-18 { width: 54px; }
+.qr-s-19 { width: 57px; }
+.qr-s-20 { width: 60px; }
+.qr-s-21 { width: 63px; }
+.qr-s-22 { width: 66px; }
+.qr-s-23 { width: 69px; }
+.qr-s-24 { width: 72px; }
+.qr-s-25 { width: 75px; }
+.qr-s-26 { width: 78px; }
+.qr-s-27 { width: 81px; }
+.qr-s-28 { width: 84px; }
+.qr-s-29 { width: 87px; }
+.qr-s-30 { width: 90px; }
+.qr-s-31 { width: 93px; }
+.qr-s-32 { width: 96px; }
+.qr-s-33 { width: 99px; }
+.qr-s-34 { width: 102px; }
+.qr-s-35 { width: 105px; }
+.qr-s-36 { width: 108px; }
+.qr-s-37 { width: 111px; }
+.qr-s-38 { width: 114px; }
+.qr-s-39 { width: 117px; }
+.qr-s-40 { width: 120px; }
+.qr-s-41 { width: 123px; }
+.qr-s-42 { width: 126px; }
+.qr-s-43 { width: 129px; }
+.qr-s-44 { width: 132px; }
+.qr-s-45 { width: 135px; }
+.qr-s-46 { width: 138px; }
+.qr-s-47 { width: 141px; }
+.qr-s-48 { width: 144px; }
+.qr-s-49 { width: 147px; }
+.qr-s-50 { width: 150px; }
+.qr-s-51 { width: 153px; }
+.qr-s-52 { width: 156px; }
+.qr-s-53 { width: 159px; }
+.qr-s-54 { width: 162px; }
+.qr-s-55 { width: 165px; }
+.qr-s-56 { width: 168px; }
+.qr-s-57 { width: 171px; }
+.qr-s-58 { width: 174px; }
+.qr-s-59 { width: 177px; }
+.qr-s-60 { width: 180px; }
+.qr-s-61 { width: 183px; }
+.qr-s-62 { width: 186px; }
+.qr-s-63 { width: 189px; }
+.qr-s-64 { width: 192px; }
+.qr-s-65 { width: 195px; }
+
+.login-right {
+  flex-grow: 1;
+  flex-shrink: 1;
+  flex-basis: 0px;
+  height: 242px;
+  flex-direction: column;
+  justify-content: center;
+  padding-left: 18px;
+  padding-right: 18px;
+}
+
+.login-title {
+  font-size: 22px;
+  font-weight: 600;
+  color: @ys-gold-bright;
+  letter-spacing: 3px;
+  font-family: serif;
+}
+
+.login-sub {
+  margin-top: 4px;
+  font-size: 12px;
+  color: @ys-text-dim;
+  letter-spacing: 1px;
+}
+
+.login-state-row {
+  margin-top: 14px;
+  flex-direction: row;
+  align-items: center;
+  height: 18px;
+}
+
+.login-state {
+  font-size: 14px;
+  color: @ys-text;
+  letter-spacing: 1px;
+}
+
+.login-mark-gap {
+  width: 8px;
+}
+
+.login-flow {
+  margin-top: 10px;
+  flex-direction: row;
+  align-items: center;
+}
+
+.login-flow-step {
+  font-size: 11px;
+  color: @ys-text-mute;
+  letter-spacing: 1px;
+}
+
+.login-flow-step-on {
+  color: @ys-gold;
+}
+
+.login-flow-arrow {
+  width: 14px;
+  height: 1px;
+  margin-left: 6px;
+  margin-right: 6px;
+  background-color: @ys-gold-line-2;
+}
+
+.login-actions {
+  margin-top: 16px;
+  flex-direction: row;
+  align-items: center;
+}
+
+.login-btn-gap {
+  width: 10px;
+}
+
+.login-err {
+  margin-top: 10px;
+  font-size: 12px;
+  color: @ys-danger;
+  lines: 2;
+}
+
+/* ---------------- home ---------------- */
+.hm-body {
+  width: 960px;
+  height: 242px;
+  flex-direction: row;
+}
+
+.hm-left {
+  width: 264px;
+  height: 242px;
+  flex-direction: column;
+  padding-left: 14px;
+  padding-right: 12px;
+  padding-top: 10px;
+  background-color: @ys-card;
+}
+
+.hm-avatar {
+  width: 54px;
+  height: 54px;
+  border-radius: 27px;
+  border-width: 1px;
+  border-color: @ys-gold-line;
+  background-color: @ys-card-2;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+
+/* 无头像图时用昵称首字占位，避免显示一个空圈 */
+.hm-avatar-txt {
+  font-size: 22px;
+  color: @ys-gold;
+  font-family: serif;
+}
+
+.hm-acc-row {
+  flex-direction: row;
+  align-items: center;
+}
+
+.hm-acc-txt {
+  flex-grow: 1;
+  flex-shrink: 1;
+  flex-basis: 0px;
+  flex-direction: column;
+  justify-content: center;
+  padding-left: 12px;
+}
+
+.hm-nick {
+  font-size: 16px;
+  color: @ys-text;
+  letter-spacing: 1px;
+}
+
+.hm-uid {
+  margin-top: 2px;
+  font-size: 10px;
+  color: @ys-text-mute;
+  letter-spacing: 1px;
+}
+
+.hm-time-card {
+  margin-top: 12px;
+  height: 62px;
+  border-width: 1px;
+  border-color: @ys-gold-line;
+  border-radius: 2px;
+  background-color: @ys-card-2;
+  flex-direction: column;
+  justify-content: center;
+  padding-left: 12px;
+}
+
+.hm-time-label {
+  font-size: 10px;
+  color: @ys-text-mute;
+  letter-spacing: 2px;
+}
+
+.hm-time-val {
+  font-size: 24px;
+  font-weight: 700;
+  color: @ys-gold-bright;
+  letter-spacing: 1px;
+}
+
+.hm-time-unit {
+  font-size: 12px;
+  color: @ys-gold;
+  letter-spacing: 1px;
+}
+
+.hm-time-bad {
+  color: @ys-danger;
+}
+
+.hm-mid {
+  flex-grow: 1;
+  flex-shrink: 1;
+  flex-basis: 0px;
+  height: 242px;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+
+.hm-gear-name {
+  font-size: 13px;
+  color: @ys-gold;
+  letter-spacing: 3px;
+}
+
+/* 主 CTA：金色描边大按钮。高 78 是「242 里还留得住上下文案」的上限 */
+.hm-cta {
+  margin-top: 8px;
+  width: 300px;
+  height: 78px;
+  border-width: 2px;
+  border-color: @ys-gold;
+  border-radius: 3px;
+  background-color: rgba(211, 188, 142, 0.14);
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  box-shadow: ~"0 0 12px rgba(240,217,168,0.18)";
+  transition-property: opacity;
+  transition-duration: 120ms;
+  transition-timing-function: linear;
+}
+
+.hm-cta-on {
+  background-color: rgba(211, 188, 142, 0.28);
+  box-shadow: ~"0 0 16px rgba(240,217,168,0.32)";
+}
+
+.hm-cta-title {
+  font-size: 26px;
+  font-weight: 700;
+  color: @ys-gold-bright;
+  letter-spacing: 8px;
+  font-family: serif;
+}
+
+.hm-cta-sub {
+  margin-top: 2px;
+  font-size: 10px;
+  color: @ys-text-dim;
+  letter-spacing: 2px;
+}
+
+.hm-hint {
+  margin-top: 10px;
+  font-size: 10px;
+  color: @ys-text-mute;
+  letter-spacing: 1px;
+}
+
+.hm-right {
+  width: 264px;
+  height: 242px;
+  flex-direction: column;
+  padding-left: 12px;
+  padding-right: 12px;
+  padding-top: 8px;
+  background-color: @ys-card;
+}
+
+.hm-sec-title {
+  font-size: 10px;
+  color: @ys-text-mute;
+  letter-spacing: 3px;
+  height: 16px;
+}
+
+/* 画质档位：5 档 x (30+5) = 175，加标题与设置入口仍在 242 内 */
+.hm-gear {
+  height: 30px;
+  margin-bottom: 5px;
+  border-width: 1px;
+  border-color: @ys-gold-line-2;
+  border-radius: 2px;
+  padding-left: 10px;
+  padding-right: 10px;
+  flex-direction: row;
+  align-items: center;
+  background-color: @ys-card-2;
+}
+
+.hm-gear-on {
+  border-color: @ys-gold;
+  background-color: rgba(211, 188, 142, 0.18);
+}
+
+.hm-gear-name-txt {
+  font-size: 12px;
+  color: @ys-text;
+  letter-spacing: 1px;
+}
+
+.hm-gear-name-on {
+  color: @ys-gold-bright;
+}
+
+.hm-gear-bit {
+  font-size: 10px;
+  color: @ys-text-mute;
+}
+
+.hm-gear-spring {
+  flex-grow: 1;
+  flex-shrink: 1;
+  flex-basis: 0px;
+}
+
+/* ---------------- 计费确认浮层 ----------------
+ * 为什么不做成独立 mode：确认只在 home 上一瞬间存在，做成 mode 会打断 home
+ * 已有的状态（画质选择、钱包刷新）。用 visible 开关，home 的数据原地保留。 */
+.cf-mask {
+  width: 960px;
+  height: 242px;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background-color: rgba(4, 10, 16, 0.82);
+}
+
+.cf-card {
+  width: 520px;
+  height: 190px;
+  border-width: 1px;
+  border-color: @ys-gold;
+  border-radius: 3px;
+  background-color: @ys-card;
+  flex-direction: column;
+  padding-left: 24px;
+  padding-right: 24px;
+  padding-top: 16px;
+  box-shadow: ~"0 0 18px rgba(0,0,0,0.6)";
+}
+
+.cf-title {
+  font-size: 18px;
+  font-weight: 600;
+  color: @ys-gold-bright;
+  letter-spacing: 3px;
+  font-family: serif;
+}
+
+.cf-line {
+  margin-top: 8px;
+  font-size: 12px;
+  color: @ys-text-dim;
+  letter-spacing: 1px;
+  lines: 2;
+}
+
+.cf-warn {
+  margin-top: 6px;
+  font-size: 12px;
+  color: @ys-warn;
+  letter-spacing: 1px;
+}
+
+.cf-btns {
+  margin-top: 14px;
+  flex-direction: row;
+  align-items: center;
+}
+
+.cf-btn {
+  width: 150px;
+  height: 34px;
+  margin-right: 16px;
+  border-width: 1px;
+  border-color: @ys-gold-line;
+  border-radius: 2px;
+  background-color: @ys-card-2;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+
+.cf-btn-go {
+  border-color: @ys-gold;
+  background-color: rgba(211, 188, 142, 0.24);
+}
+
+.cf-btn-txt {
+  font-size: 14px;
+  color: @ys-text;
+  letter-spacing: 2px;
+}
+
+.cf-btn-txt-go {
+  color: @ys-gold-bright;
+}
+
+/* ---------------- dispatching ---------------- */
+.dp-wrap {
+  width: 960px;
+  height: 242px;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+
+.dp-title {
+  font-size: 22px;
+  font-weight: 600;
+  color: @ys-gold-bright;
+  letter-spacing: 6px;
+  font-family: serif;
+}
+
+.dp-node {
+  margin-top: 6px;
+  font-size: 12px;
+  color: @ys-text-dim;
+  letter-spacing: 2px;
+}
+
+.dp-queue {
+  margin-top: 8px;
+  font-size: 13px;
+  color: @ys-gold;
+  letter-spacing: 1px;
+}
+
+/* 步骤条：圆点 + 连线全部手写几何，不用伪元素（Falcon 不支持） */
+.dp-steps {
+  margin-top: 16px;
+  flex-direction: row;
+  align-items: center;
+  height: 26px;
+}
+
+.dp-step {
+  flex-direction: column;
+  align-items: center;
+  width: 96px;
+}
+
+.dp-step-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 6px;
+  border-width: 1px;
+  border-color: @ys-gold-line;
+  background-color: @ys-card-3;
+}
+
+.dp-step-dot-on {
+  border-color: @ys-gold;
+  background-color: @ys-gold;
+}
+
+.dp-step-dot-done {
+  border-color: @ys-gold-deep;
+  background-color: @ys-gold-deep;
+}
+
+.dp-step-txt {
+  margin-top: 5px;
+  font-size: 10px;
+  color: @ys-text-mute;
+  letter-spacing: 1px;
+}
+
+.dp-step-txt-on {
+  color: @ys-gold-bright;
+}
+
+.dp-line {
+  width: 60px;
+  height: 1px;
+  background-color: @ys-gold-line-2;
+  margin-bottom: 16px;
+}
+
+.dp-line-on {
+  background-color: @ys-gold-deep;
+}
+
+.dp-actions {
+  margin-top: 16px;
+  flex-direction: row;
+  align-items: center;
+}
+
+/* ---------------- playing ----------------
+ * 关键约束：X6 Pro 的视频走 KMS overlay 平面，**盖在 Falcon UI 之上**，
+ * 画在视频矩形内部的 UI 会被视频像素盖住、看不见。
+ * 结论：控制条必须落在视频矩形**之外**。
+ * 布局：视频 960x226 + 控制条 960x40 = 266。
+ * 收起控制条时视频扩到 960x266（player.setRect），此时整屏都是视频，
+ * 再点一下就恢复控制条 —— 触摸由 UI 层派发，与谁在上面无关。 */
+/* 视频挖孔区：必须透明，KMS 平面从这一块透出来。
+   注意 226 是「控制条 40 高时」的高度，控制条隐藏时切到 .pl-video-full（266）。 */
+.pl-video {
+  width: 960px;
+  height: 226px;
+  flex-direction: column;
+  background-color: rgba(0, 0, 0, 0);
+}
+
+.pl-video-full {
+  height: 266px;
+  flex-direction: column;
+}
+
+/* 触摸映射层：铺满视频区，只把触点归一化后转发给 native，自己不发网络请求 */
+.pl-touch {
+  width: 960px;
+  height: 226px;
+}
+
+.pl-touch-full {
+  height: 266px;
+}
+
+/* 视频未上屏时的占位（native 模块缺失 / 首帧未到） */
+.pl-ph {
+  width: 960px;
+  height: 226px;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background-color: @ys-video-bg;
+}
+
+.pl-ph-big {
+  height: 266px;
+}
+
+.pl-ph-title {
+  font-size: 18px;
+  color: @ys-gold;
+  letter-spacing: 4px;
+  font-family: serif;
+}
+
+.pl-ph-sub {
+  margin-top: 6px;
+  font-size: 11px;
+  color: @ys-text-mute;
+  letter-spacing: 1px;
+  lines: 2;
+}
+
+.pl-rail {
+  width: 960px;
+  height: 40px;
+  padding-left: 12px;
+  padding-right: 12px;
+  flex-direction: row;
+  align-items: center;
+  background-color: @ys-rail-bg;
+}
+
+.pl-btn {
+  height: 26px;
+  margin-right: 8px;
+  padding-left: 10px;
+  padding-right: 10px;
+  border-width: 1px;
+  border-color: @ys-gold-line;
+  border-radius: 2px;
+  background-color: @ys-card-2;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+
+.pl-btn-on {
+  border-color: @ys-gold;
+  background-color: rgba(211, 188, 142, 0.2);
+}
+
+.pl-btn-txt {
+  font-size: 12px;
+  color: @ys-text;
+  letter-spacing: 1px;
+}
+
+.pl-btn-txt-on {
+  color: @ys-gold-bright;
+}
+
+.pl-stat {
+  font-size: 10px;
+  color: @ys-text-mute;
+  letter-spacing: 1px;
+  margin-right: 10px;
+}
+
+.pl-spring {
+  flex-grow: 1;
+  flex-shrink: 1;
+  flex-basis: 0px;
+}
+
+/* ---------------- error ---------------- */
+.er-wrap {
+  width: 960px;
+  height: 265px;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+
+.er-code {
+  font-size: 34px;
+  font-weight: 700;
+  color: @ys-danger;
+  letter-spacing: 2px;
+  font-family: serif;
+}
+
+.er-code-unknown {
+  font-size: 20px;
+}
+
+.er-msg {
+  margin-top: 8px;
+  font-size: 15px;
+  color: @ys-text;
+  letter-spacing: 2px;
+  lines: 2;
+}
+
+.er-detail {
+  margin-top: 6px;
+  font-size: 10px;
+  color: @ys-text-mute;
+  letter-spacing: 1px;
+  lines: 2;
+}
+
+.er-btns {
+  margin-top: 18px;
+  flex-direction: row;
+  align-items: center;
+}
+
+/* 页面级细分隔线 */
+.gem-strip {
+  width: 960px;
+  height: 1px;
+  background-color: @ys-gold-line-2;
+}
+
+/* 动画：只动 opacity。Falcon 的 animation 支持未经真机验证，所以每个元素
+   都保证「无动画也正确」——静态外观就是动画的最终态。 */
+.fade-in {
+  opacity: 1;
+  animation-name: fadeIn;
+  animation-duration: 260ms;
+  animation-timing-function: linear;
+  animation-iteration-count: 1;
+}
+/* ---------------- 追加段：写模板时补出来的类 ----------------
+ * 为什么追加在文件末尾：Falcon 的样式等价特异性靠源码顺序决胜，
+ * 追加在最后天然覆盖前面的同名基础规则，不需要提高权重（也不允许组合选择器）。 */
+
+/* 每个 mode 的整页容器。根节点 .page 负责背景色/渐变，
+ * .mshell 负责"横向 960 定宽 + 竖向 266 定高 + 列向排列"。
+ * 为什么每个 mode 各自套一层而不是共享：各 mode 的竖向分段（24+242 / 1+265）
+ * 不一样，套一层各自的容器才能保证高度预算不被 flex-grow 打乱。 */
+.mshell {
+  width: 960px;
+  height: 266px;
+  flex-direction: column;
+}
+
+/* boot 的高度预算：1px 金线 + 243 主体 + 22 页脚 = 266。
+ * 生成器里 .boot-wrap 原本写死 265，这里覆盖成 243（追加在末尾 → 源码顺序决胜）。 */
+.boot-wrap {
+  height: 243px;
+}
+
+/* 行向容器。Falcon 里 div 默认不是 row（参考项目全部显式声明 flex-direction），
+ * 又不能用后代选择器，所以给最常见的「一行内容」准备一个可复用的单类名。 */
+.row {
+  flex-direction: row;
+  align-items: center;
+}
+
+/* home：剩余时长「数字 + 单位」同一行。<text> 不能嵌套，
+ * 一行里不同字号只能靠兄弟节点 + 行向容器拼，所以必须有这个 row 容器类。 */
+.hm-time-row {
+  flex-direction: row;
+  align-items: center;
+  height: 30px;
+}
+
+/* 按钮之间的水平间距。不用 margin 简写（styler 会展开，容易和已有 margin 打架），
+ * 也不依赖 flex gap（本项目从未验证过 gap 在真机生效）。 */
+.btn-gap {
+  width: 10px;
+}
+
+/* playing：断开按钮用危险色，与暂停/画质等中性控制键区分，降低误触概率 */
+.pl-btn-danger {
+  border-color: rgba(226, 112, 95, 0.55);
+  background-color: rgba(226, 112, 95, 0.14);
+}
+
+.pl-btn-txt-danger {
+  color: #e2705f;
+}
+
+/* playing：控制条右侧实时指标（fps / 延迟 / 码率），小字暗色，不抢画面 */
+.pl-stat-ok {
+  color: #7fc7a8;
+}
+
+/* dispatching：取消排队按钮前的间距容器 */
+.dp-btn-gap {
+  width: 14px;
+}
+
+/* playing：占位块内提示行之间的固定高度垫片 */
+.pl-ph-gap {
+  height: 10px;
+}
+
+/* home：左栏昵称行与时长卡片之间的固定间距 */
+.hm-vgap {
+  height: 12px;
+}
+
+/* login：二维码下方的小字兜底提示（编码失败或容量不足时显示原因） */
+.qr-tip {
+  margin-top: 8px;
+  font-size: 10px;
+  color: #b9b0a0;
+  letter-spacing: 1px;
+  lines: 2;
+  text-align: center;
+}
+
+/* ---------------- playing 的两档控制条 ----------------
+ * 画布恒高 266，控制条占 40，因此视频区 = 266 - 40 = 226。
+ * 一键隐藏时控制条换成 16px 的「唤起条」——**不能真正收成 0**，
+ * 否则收起后再也点不回来。视频区随之变 250。
+ * 两档都用 flex 列排布、不用绝对定位，视频区永远不会被控制条压住，
+ * 这就是「控制条不挡画面中央」的实现方式。 */
+.pl-video-mid {
+  width: 960px;
+  height: 250px;
+  flex-direction: column;
+  background-color: rgba(0, 0, 0, 0);
+}
+
+/* 触摸映射层：铺满视频区，只把触点归一化后转发给 native，自己不发网络请求。
+ * 显式写 flex-direction 是因为里面的占位块要按列居中。 */
+.pl-touch {
+  flex-direction: column;
+}
+
+.pl-touch-mid {
+  height: 250px;
+  flex-direction: column;
+}
+
+/* 占位块用弹性高度，226 / 250 两档共用同一个类，不必给每档各写一份 */
+.pl-ph-fill {
+  width: 960px;
+  flex-grow: 1;
+  flex-shrink: 1;
+  flex-basis: 0px;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background-color: @ys-video-bg;
+}
+
+/* 控制条收起后的唤起条（16 逻辑像素映射到面板约 16px 高，是可点中的最小尺寸） */
+.pl-handle {
+  width: 960px;
+  height: 16px;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  background-color: @ys-rail-bg;
+  border-top-width: 1px;
+  border-color: @ys-gold-line-2;
+}
+
+.pl-handle-txt {
+  font-size: 9px;
+  color: @ys-text-mute;
+  letter-spacing: 2px;
+}
+
+/* ---------------- 弹层的窄按钮 ----------------
+ * 设置面板里要横排 4 个按钮，.cf-btn 的 150 宽放不下（4*150 + 间距 > 472 内宽），
+ * 所以另开一个 100 宽的窄版，复用 .cf-btn 的描边/底色语义。 */
+.cf-btn-s {
+  width: 100px;
+  height: 32px;
+  margin-right: 10px;
+  border-width: 1px;
+  border-color: @ys-gold-line;
+  border-radius: 2px;
+  background-color: @ys-card-2;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+}
+
+/* home 左栏底部的次要操作（退出登录）—— 弱化描边，避免和主 CTA 抢注意力 */
+.hm-link {
+  height: 24px;
+  border-width: 1px;
+  border-color: @ys-gold-line-2;
+  border-radius: 2px;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+}
+
+.hm-link-txt {
+  font-size: 11px;
+  color: @ys-text-dim;
+  letter-spacing: 2px;
+}
+
+/* dispatching 的取消按钮：弱描边 */
+.dp-cancel {
+  height: 26px;
+  padding-left: 16px;
+  padding-right: 16px;
+  border-width: 1px;
+  border-color: @ys-gold-line-2;
+  border-radius: 2px;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+}
+
+.dp-cancel-txt {
+  font-size: 12px;
+  color: @ys-text-dim;
+  letter-spacing: 2px;
+}
