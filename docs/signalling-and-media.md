@@ -155,7 +155,12 @@ this.later(() => {
 - 什么都不给时 answer 里不出现 `a=candidate`（纯 trickle 模式）；
 - answer 必须带我们生成的 `a=ice-ufrag` / `a=ice-pwd`（服务端拿它校验 STUN USERNAME
   里的 `remote:local`，缺了同样是不回包）；
-- `a=group:BUNDLE` 不能包含被拒绝的 m-line（我们拒绝 `m=application`，所以只有 `0 1`）。
+- `a=group:BUNDLE` 不能包含被拒绝的 m-line（我们拒绝 `m=application`，所以只有 `0 1`）；
+- 被接受的 m-line 端口要写我们真实的媒体端口（不是 offer 里的 `9`），`c=` 要写我们真正的
+  源地址——浏览器就是这么答的，把 `9`/`0.0.0.0` 留给 ICE 去猜，会让只认 m-line 的边缘
+  把 DTLS 打到 9 号端口；
+- answer 里要有 `a=ice-options:trickle`：我们随后确实通过信令补发了 candidate，
+  声明与行为不一致时严格的 SDP 校验器会整份拒绝。
 
 跑法（zig 交叉编译到 Windows 主机，和真机库同一套工具链）：
 

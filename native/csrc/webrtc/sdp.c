@@ -755,6 +755,18 @@ void sdp_answer_cfg_init(sdp_answer_cfg_t *cfg)
     cfg->accept_datachannel = 0; /* no SCTP on this device                  */
 }
 
+/* Port for the accepted m-lines: our real media port when we know it, then
+ * the legacy candidate port, else the offer's 9 (ICE will provide it). */
+static int media_port(const sdp_answer_cfg_t *cfg)
+{
+    if (!cfg) return 9;
+    if (cfg->local_cand_port > 0 && cfg->local_cand_port <= 65535)
+        return cfg->local_cand_port;
+    if (cfg->candidate_port > 0 && cfg->candidate_port <= 65535)
+        return cfg->candidate_port;
+    return 9;
+}
+
 int sdp_build_answer(const sdp_offer_t *offer, const sdp_answer_cfg_t *cfg,
                      char *out, size_t cap, char *err, size_t errcap)
 {
@@ -844,6 +856,10 @@ int sdp_build_answer(const sdp_offer_t *offer, const sdp_answer_cfg_t *cfg,
     }
     wb_printf(&w, "\r\n");
 
+    /* Browsers always advertise trickle in the answer, and we do send our
+     * candidate over signalling right after it (see sig_send_candidate), so
+     * say so: a strict SDP validator on the edge rejects the mismatch. */
+    wb_printf(&w, "a=ice-options:trickle\r\n");
     wb_printf(&w, "a=msid-semantic: WMS\r\n");
 
     for (i = 0; i < offer->n_media; i++) {
@@ -895,8 +911,11 @@ int sdp_build_answer(const sdp_offer_t *offer, const sdp_answer_cfg_t *cfg,
             else if (chosen == SDP_CODEC_H265) pt = m->h265_pt;
             else if (chosen == SDP_CODEC_OPUS) pt = m->opus_pt;
 
+            /* Browsers put the real media port here, not the offer's 9:
+             * with an inline candidate the two must agree, or an edge that
+             * trusts the m-line over a=candidate sends DTLS to port 9. */
             wb_printf(&w, "m=%s %d %s %d\r\n", m->media,
-                      cfg->candidate_port > 0 ? cfg->candidate_port : 9,
+                      media_port(cfg),
                       m->proto[0] ? m->proto : "UDP/TLS/RTP/SAVPF", pt);
 
             wb_printf(&w, "c=IN IP4 %s\r\n",

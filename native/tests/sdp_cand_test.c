@@ -126,7 +126,7 @@ int main(void)
     /* ---- case 1: the fix -- our real endpoint wins ------------------- */
     printf("case 1: local_cand_ip/port set\n");
     sdp_answer_cfg_init(&cfg);
-    cfg.local_ip = "0.0.0.0";
+    cfg.local_ip = "192.168.0.198";   /* session.c: W.udp_local_ip */
     cfg.fingerprint = "sha-256 11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:"
                       "11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00";
     cfg.local_cand_ip = "192.168.0.198";
@@ -149,6 +149,12 @@ int main(void)
               "candidate carries our own ip:port");
         check(strstr(line, "typ host") != NULL, "candidate is typ host");
     }
+    check(strstr(answer, "m=audio 45789 ") != NULL,
+          "accepted m-line carries our real media port, not the offer's 9");
+    check(strstr(answer, "c=IN IP4 192.168.0.198") != NULL,
+          "c= names the address we actually send from");
+    check(strstr(answer, "a=ice-options:trickle") != NULL,
+          "answer advertises trickle (we do send a candidate over signalling)");
 
     /* ---- case 2: legacy fallback still honoured ---------------------- */
     printf("case 2: only candidate_ip/port set (legacy path)\n");
@@ -185,6 +191,7 @@ int main(void)
           "application rejected with port 0 (no SCTP)");
     check(strstr(answer, "a=setup:active") != NULL, "a=setup:active");
     check(strstr(answer, "a=mid:1") != NULL, "mid values preserved");
+
 
     /* ---- case 5: the answer must authenticate our ICE checks --------- */
     printf("case 5: answer carries our ICE/DTLS credentials\n");

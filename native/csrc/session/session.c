@@ -1100,7 +1100,10 @@ static int w_run_session(void) {
         cfg.fingerprint = dtls_local_fingerprint(W.dtls);
         cfg.local_cand_ip = W.udp_local_ip[0] ? W.udp_local_ip : NULL;
         cfg.local_cand_port = W.udp_local_port;
-        cfg.local_ip = "0.0.0.0";          /* candidates arrive out of band */
+        /* c= must name the address we actually send from; 0.0.0.0 only
+         * when the socket somehow failed to bind. Candidates themselves
+         * arrive out of band (trickle) and are rewritten above. */
+        cfg.local_ip = W.udp_local_ip[0] ? W.udp_local_ip : "0.0.0.0";
         cfg.codecs = SDP_CODEC_H264 | SDP_CODEC_OPUS;
         cfg.sendrecv = 0;                  /* we receive only */
         cfg.accept_datachannel = 0;        /* no SCTP on this device */
